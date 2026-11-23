@@ -46,3 +46,6 @@ logs/
 /pgo-inplace/*
 !/pgo-inplace/*.gcda
 *.stream
+# ...except the port's icon (the NRO's, and the README's full-size copy)
+!/app/icon.jpg
+!/tools/switch/icon/*.jpg

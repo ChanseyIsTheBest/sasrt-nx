@@ -1,4 +1,8 @@
-# sasrt-nx
+<p align=center><img src="tools/switch/icon/sasrt_icon.jpg" alt="Sonic &amp; All-Stars Racing Transformed" width="256" height="256"></p>
+
+<h1 align=center>Sonic &amp; All-Stars Racing Transformed: Nintendo Switch port</h1>
+
+<p align=center><b>sasrt-nx 1.0.0</b> · <a href="https://chanseyisthebest.github.io/sasrt-nx-installer/">web installer</a> · <a href="https://github.com/ChanseyIsTheBest/sasrt-nx/releases/tag/v1.0.0">release</a></p>
 
 An unofficial native port of the Xbox 360 version of **Sonic & All-Stars Racing Transformed** (title `5345085D`), first
 to Windows PC and then to the Nintendo Switch, by static recompilation with [ReXGlue](https://github.com/rexglue/rexglue-sdk).
