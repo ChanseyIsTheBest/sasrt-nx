@@ -416,8 +416,10 @@ std::vector<Setting> MakeSettings(const std::string& file) {
   add(T_DYNRES, "banjo_renut_dynamic_resolution", false, on_off(), 0, Tr(H_DYNRES));
   add(T_DYN_HH_MIN, "banjo_renut_dynamic_handheld_low", false, heights(360, 720), 5, Tr(H_DYN_HH_MIN));     // 540
   add(T_DYN_HH_MAX, "banjo_renut_dynamic_handheld_high", false, heights(360, 720), 10, Tr(H_DYN_HH_MAX));   // 720
-  add(T_DYN_DK_MIN, "banjo_renut_dynamic_docked_low", false, heights(540, 1080), 5, Tr(H_DYN_DK_MIN));      // 720
-  add(T_DYN_DK_MAX, "banjo_renut_dynamic_docked_high", false, heights(540, 1080), 15, Tr(H_DYN_DK_MAX));    // 1080
+  // sasrt-nx 1.0.1 (2026-11-24, the user: docked 540p-720p by default, as handheld; then "Clamp dynamic resolution the
+  // config so it cant go above 720p"): defaults 540 and 720 (720 and 1080), choices up to 720 (1080)
+  add(T_DYN_DK_MIN, "banjo_renut_dynamic_docked_low", false, heights(540, 720), 0, Tr(H_DYN_DK_MIN));       // 540
+  add(T_DYN_DK_MAX, "banjo_renut_dynamic_docked_high", false, heights(540, 720), 5, Tr(H_DYN_DK_MAX));      // 720
   add(T_HANDHELD, "banjo_renut_render_height_handheld", false, heights(360, 720), 10, Tr(H_HANDHELD_SASRT));  // 720
   add(T_DOCKED, "banjo_renut_render_height_docked", false, heights(540, 1080), 5, Tr(H_DOCKED_SASRT));        // 720
   add(T_RUMBLE, "input_rumble", false, on_off(), 0, Tr(H_RUMBLE), /*always_in_file=*/false);

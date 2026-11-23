@@ -2324,19 +2324,65 @@ REXCVAR_DEFINE_INT32(sasrt_memory_critical_mb, 128, "SASRT/Graphics",
                      "sasrt_memory_governor: the critical mark (MB of heap free)")
     .range(8, 2048)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// sasrt-nx 1.0.1 (2026-11-24, the docked bad_alloc, out/console_runs/c1124_101/user_1080): the figure above adds the GPU
+// region's free space to the heap's room (what a GPU block can use), and in docked mode it read 782 MB while newlib, the
+// CPU side, had 215: the region's 567 MB were free in 48 ranges inside it, which newlib cannot use (its heap ends at the
+// region's bottom). The region then grew into the rest and the game's own allocation failed with 0.6 MB left; the
+// governor saw its critical mark 3 s before. So the CPU side's room is a figure of its own: the heap's room and the
+// region's free bottom (Deko3DRegionGiveBack can return it), against marks of its own; either side under its mark makes
+// memory low / critical.
+REXCVAR_DEFINE_BOOL(sasrt_memory_cpu_governor, true, "SASRT/Graphics",
+                    "sasrt_memory_governor also watches the CPU side's room on its own (the heap's room and the GPU "
+                    "region's free bottom, not the region's free space inside it): under sasrt_memory_cpu_low_mb memory "
+                    "is low, under sasrt_memory_cpu_critical_mb critical, and the region's free bottom goes back")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(sasrt_memory_cpu_low_mb, 160, "SASRT/Graphics",
+                     "sasrt_memory_cpu_governor: the CPU side's low mark (MB of heap room and region free bottom)")
+    .range(16, 2048)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(sasrt_memory_cpu_critical_mb, 96, "SASRT/Graphics",
+                     "sasrt_memory_cpu_governor: the CPU side's critical mark (MB of heap room and region free bottom)")
+    .range(8, 2048)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// sasrt-nx 1.0.1 (2026-11-24): the room the GPU region leaves newlib (plume's Deko3DSetRegionCpuReserve; 32 MB before):
+// the region's growth and a GPU block's fallback to newlib stop there and fail as the memory emergency (textures released,
+// the resolution a step down) where the CPU side's failure was the game's crash. 0: the old 32 MB.
+REXCVAR_DEFINE_INT32(sasrt_region_cpu_reserve_mb, 160, "SASRT/Graphics",
+                     "The MB of heap the GPU region always leaves the CPU side (its growth and GPU blocks' fallback to the "
+                     "heap stop there: a GPU block fails, which the memory emergency answers, instead of the game's own "
+                     "allocation); 0: 32 MB as before")
+    .range(0, 1024)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 std::atomic<uint32_t> g_heap_free_mb{UINT32_MAX};
+std::atomic<uint32_t> g_cpu_free_mb{UINT32_MAX};  // sasrt-nx 1.0.1
 std::atomic<uint32_t> g_memory_emergency_looks{0};  // sasrt-nx (2026-11-09 night)
 bool MemoryLow() {
   static const bool on = REXCVAR_GET(sasrt_memory_governor);
   static const uint32_t mark = uint32_t(REXCVAR_GET(sasrt_memory_low_mb));
+  static const uint32_t cpu_mark = REXCVAR_GET(sasrt_memory_cpu_governor) ? uint32_t(REXCVAR_GET(sasrt_memory_cpu_low_mb)) : 0;
   return on && (g_heap_free_mb.load(std::memory_order_relaxed) < mark ||
+                g_cpu_free_mb.load(std::memory_order_relaxed) < cpu_mark ||
                 g_memory_emergency_looks.load(std::memory_order_relaxed) != 0);
 }
 bool MemoryCritical() {
   static const bool on = REXCVAR_GET(sasrt_memory_governor);
   static const uint32_t mark = uint32_t(REXCVAR_GET(sasrt_memory_critical_mb));
+  static const uint32_t cpu_mark =
+      REXCVAR_GET(sasrt_memory_cpu_governor) ? uint32_t(REXCVAR_GET(sasrt_memory_cpu_critical_mb)) : 0;
   return on && (g_heap_free_mb.load(std::memory_order_relaxed) < mark ||
+                g_cpu_free_mb.load(std::memory_order_relaxed) < cpu_mark ||
                 g_memory_emergency_looks.load(std::memory_order_relaxed) != 0);
+}
+bool CpuGovernorOn() {  // sasrt-nx 1.0.1
+  static const bool on = REXCVAR_GET(sasrt_memory_governor) && REXCVAR_GET(sasrt_memory_cpu_governor);
+  return on;
+}
+uint32_t CpuLowMarkMb() {  // sasrt-nx 1.0.1
+  static const uint32_t mark = uint32_t(REXCVAR_GET(sasrt_memory_cpu_low_mb));
+  return mark;
+}
+uint64_t RegionCpuReserveBytes() {  // sasrt-nx 1.0.1: 0 keeps plume's 32 MB
+  return uint64_t(REXCVAR_GET(sasrt_region_cpu_reserve_mb)) << 20;
 }
 uint32_t MemoryLowMarkMb() {
   static const uint32_t mark = uint32_t(REXCVAR_GET(sasrt_memory_low_mb));

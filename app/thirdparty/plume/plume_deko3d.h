@@ -1175,8 +1175,18 @@ namespace plume {
         bool on = false;
         uint64_t size = 0, used = 0, peak = 0, freeBytes = 0, largestFree = 0, givenBack = 0, refused = 0;
         uint32_t freeRanges = 0, blocks = 0, growths = 0, givebacks = 0;
+        // sasrt-nx 1.0.1 (2026-11-24): the free range at the region's bottom (what Deko3DRegionGiveBack can return to
+        // newlib), and the region's growths and fallbacks refused for the CPU side's reserve (Deko3DSetRegionCpuReserve).
+        uint64_t freeBottom = 0, reserveRefused = 0;
     };
     void Deko3DGpuRegionFigures(Deko3DGpuRegionInfo &out);
+    // sasrt-nx 1.0.1 (2026-11-24, the docked bad_alloc: the region grew down to newlib's last 32 MB, then the game's own
+    // allocation failed with 0.6 MB of heap left; out/console_runs/c1124_101/user_1080): the room the GPU side leaves to
+    // newlib. The region does not lower newlib's end closer than this above its break, and a GPU block the region could
+    // not place does not take newlib's memory below it either: such a block fails (the memory emergency path, which the
+    // governor answers by releasing textures and stepping the resolution down) where the CPU side's failure is a crash.
+    // 32 MB (the old kRegionNewlibSlack) until set.
+    void Deko3DSetRegionCpuReserve(uint64_t bytes);
     // banjo-nx (2026-10-28, render-thread round): how many graphics pipelines are provisional now (made at creation,
     // dropped when refreshPipeline finds every variant or the pipeline goes), and whether a draw may take a zero count
     // as its answer (Deko3DSetProvisionalCount; Banjo's A/B 68). Every draw asked its pipeline (a line of the pipeline

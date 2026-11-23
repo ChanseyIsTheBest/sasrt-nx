@@ -891,7 +891,8 @@ if(REXGLUE_PLATFORM_SWITCH)
     # 2026-11-22, the user: "please make the version 1.0.0 and this image the icon ... make the author
     # ChanseyIsTheBest". A plain variable (a cache entry before: an existing build tree kept its 0.1.0); icon.jpg is the
     # user's image (Downloads, sonic-and-all-stars-racing-transformed-button), 256x256 JPEG as hbmenu takes it.
-    set(SASRT_VERSION "1.0.0")
+    # 2026-11-24, the user: "yes start 1.0.1 with blur's fix" (the docked bad_alloc; plus base port 264's VFS index).
+    set(SASRT_VERSION "1.0.1")
     rexglue_switch_add_nro(sasrt
         NAME "Sonic & All-Stars Racing Transformed"  # 2026-11-22, the user; the NACP is made without a shell
         AUTHOR "ChanseyIsTheBest"

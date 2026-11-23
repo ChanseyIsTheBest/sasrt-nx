@@ -566,6 +566,17 @@ REXCVAR_DEFINE_INT32(sasrt_retire_current_idle_frames, 1800, "SASRT/Graphics",
     .range(0, 1000000)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// sasrt-nx 1.0.1 (2026-11-24): see the dynamic resolution's start in the latch below.
+REXCVAR_DEFINE_BOOL(sasrt_dynamic_docked_start_top, true, "SASRT/Graphics",
+                    "banjo_renut_dynamic_resolution: a game started in docked mode begins at the docked range's top, not "
+                    "its 720 end (the climb made a set of targets at each step and left the GPU region's free space in "
+                    "pieces); a change of mode still starts at 720")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+bool DockedStartTop() {
+  static const bool on = REXCVAR_GET(sasrt_dynamic_docked_start_top);
+  return on;
+}
+
 void RetireIdleTargetsLocked(bool emergency = false) {
   static const int32_t set = REXCVAR_GET(sasrt_retire_idle_targets_frames);
   // sasrt-nx (2026-11-09 night): every 10 frames (30 before), and at once in an emergency
@@ -798,12 +809,21 @@ void LatchResolutionScaleLocked() {
     static bool dynamic_started = false;
     const bool mode_changed = g_dynamic_docked.exchange(docked) != docked;
     if ((mode_changed || !dynamic_started || rebuilt) && count) {
+      const bool first_start = !dynamic_started;
       dynamic_started = true;
       // the 720 end, or (sasrt-nx, 2026-11-09) the step nearest below 720 for a range without it
       int start = 0;
       for (int i = 0; i < count; ++i)
         if (g_dynamic_steps[mode][i] <= 720)
           start = i;
+      // sasrt-nx 1.0.1 (2026-11-24, sasrt_dynamic_docked_start_top): a game started docked begins at the range's top.
+      // From 720 it climbed to 1080 in ten steps over 10 s at the menus, each step's targets larger than any range the
+      // last ones left free, so the GPU region grew 158 times to a peak of 1,372 MB in use and kept 567 MB free in 48
+      // ranges that only the GPU could use (out/console_runs/c1124_101/user_1080: the docked bad_alloc). Steps down from
+      // the top fit where the bigger targets were. A change of mode keeps the 720 start (night_gpu2: docking mid-game
+      // with the heap at its end).
+      if (first_start && docked && DockedStartTop())
+        start = count - 1;
       g_dynamic_step = start;
     }
     ++g_latches;
@@ -896,14 +916,24 @@ void LatchResolutionScaleLocked() {
     if ((heap >> 20) < 48)
       room = std::min(room, heap);
     const uint32_t mb = uint32_t(std::min<uint64_t>(room >> 20, 0xFFFFFFF0ull));
+    // sasrt-nx 1.0.1 (2026-11-24, sasrt_memory_cpu_governor; banjo_renut_tuning.cpp has the docked bad_alloc): the CPU
+    // side's own room, the heap's and the region's free bottom (newlib can have that back; the free space inside the
+    // region it cannot). UINT32_MAX with the watch off, so its marks never trip.
+    const bool cpu_watch = banjo::renut_gpu::CpuGovernorOn();
+    const uint64_t cpu_room = heap + (region.on ? uint64_t(region.freeBottom) : 0);
+    const uint32_t cpu_mb = cpu_watch ? uint32_t(std::min<uint64_t>(cpu_room >> 20, 0xFFFFFFF0ull)) : UINT32_MAX;
     const bool was_low = banjo::renut_gpu::MemoryLow(), was_critical = banjo::renut_gpu::MemoryCritical();
     banjo::renut_gpu::g_heap_free_mb.store(mb, std::memory_order_relaxed);
+    banjo::renut_gpu::g_cpu_free_mb.store(cpu_mb, std::memory_order_relaxed);
     const bool low = banjo::renut_gpu::MemoryLow(), critical = banjo::renut_gpu::MemoryCritical();
     if (!emergency && banjo::renut_gpu::g_memory_emergency_looks.load(std::memory_order_relaxed))
       banjo::renut_gpu::g_memory_emergency_looks.fetch_sub(1, std::memory_order_relaxed);
     // the GPU region's free bottom back to the heap while the heap itself (the CPU side's) is short: the docked race
-    // crashed with the command buffers' arena out of heap and 500-700 MB free in the region
-    if ((heap >> 20) < 192) {
+    // crashed with the command buffers' arena out of heap and 500-700 MB free in the region. sasrt-nx 1.0.1: also from
+    // the CPU side's low mark (sasrt_memory_cpu_low_mb), whichever is higher.
+    const uint64_t give_back_under =
+        std::max<uint64_t>(192, cpu_watch ? uint64_t(banjo::renut_gpu::CpuLowMarkMb()) : 0);
+    if ((heap >> 20) < give_back_under) {
       const uint64_t given = plume::Deko3DRegionGiveBack();
       static uint32_t given_logged = 0;
       if (given && given_logged++ < 32)
@@ -959,7 +989,9 @@ void LatchResolutionScaleLocked() {
 #endif
     static uint32_t logged = 0;
     if ((low != was_low || critical != was_critical) && logged++ < 64)
-      RGPU_INFO("[renut] {} MB free (heap and GPU region): {} (sasrt_memory_governor)", mb,
+      RGPU_INFO("[renut] {} MB free (heap and GPU region), the CPU side {} MB (heap {} MB, the region's free bottom {} "
+                "MB): {} (sasrt_memory_governor)", mb, cpu_room >> 20, heap >> 20,
+                region.on ? uint64_t(region.freeBottom) >> 20 : 0,
                 critical ? "critical: dynamic resolution steps down, the stream cache at 48 MB"
                 : low    ? "low: no dynamic resolution step up, the stream cache at 96 MB, idle targets after 60 frames"
                          : "enough again");

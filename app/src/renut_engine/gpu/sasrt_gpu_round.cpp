@@ -849,6 +849,7 @@ REXCVAR_DEFINE_BOOL(sasrt_gpu_fetch_conversion_spec, true, "SASRT/GPU",
 #include <plume_deko3d.h>
 
 #include "renut_engine/gpu/banjo_renut_record.h"  // banjo-nx (2026-11-21): StageActive
+#include "renut_engine/gpu/banjo_renut_tuning.h"  // sasrt-nx 1.0.1: RegionCpuReserveBytes
 #endif
 
 namespace renut::gpu {
@@ -948,6 +949,8 @@ void ApplyPlume() {
   plume::Deko3DSetTargetBlockCacheMb(uint32_t(REXCVAR_GET(sasrt_target_block_cache_mb)));  // sasrt-nx (2026-11-11)
   plume::Deko3DSetTargetBlockHeadroom(uint32_t(REXCVAR_GET(sasrt_target_block_headroom_8ths)));  // batch D6
   plume::Deko3DSetRegionBestFit(REXCVAR_GET(sasrt_region_best_fit));      // sasrt-nx (2026-11-09 night)
+  // sasrt-nx 1.0.1 (2026-11-24, sasrt_region_cpu_reserve_mb; banjo_renut_tuning.cpp): the room the region leaves newlib
+  plume::Deko3DSetRegionCpuReserve(banjo::renut_gpu::RegionCpuReserveBytes());
   plume::Deko3DSetImageBestFit(REXCVAR_GET(sasrt_image_best_fit));        // sasrt-nx (2026-11-09 night)
   plume::Deko3DSetImageSpareChunk(REXCVAR_GET(blur_renut_image_spare_chunk));  // blur-nx (2026-11-18, 1 % lows)
 #endif

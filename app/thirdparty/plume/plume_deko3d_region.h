@@ -154,6 +154,13 @@ struct GpuRegionRanges {
         return bytes;
     }
 
+    // sasrt-nx 1.0.1 (2026-11-24, the docked bad_alloc): the free range at the bottom, the part giveBackBottom can
+    // return to newlib (the rest of the free space is only the GPU's: newlib's heap ends at 'low').
+    uint64_t freeBottom() const {
+        auto it = free.find(low);
+        return it == free.end() ? 0 : it->second;
+    }
+
     uint64_t largestFree() const {
         uint64_t largest = 0;
         for (const auto &r : free)

@@ -219,6 +219,13 @@ uint64_t StreamCacheMaxBytes(uint64_t renut_max);
 // sasrt-nx (2026-11-09, sasrt_memory_governor): the heap's free MB (surfaces.cpp, every 30 frames; UINT32_MAX before the
 // first look), and whether it is under sasrt_memory_low_mb / sasrt_memory_critical_mb.
 extern std::atomic<uint32_t> g_heap_free_mb;
+// sasrt-nx 1.0.1 (2026-11-24, sasrt_memory_cpu_governor): the CPU side's room in MB (the heap's room and the GPU region's
+// free bottom; surfaces.cpp sets it with g_heap_free_mb), whether that watch is on, its low mark, and the room the region
+// leaves the CPU side (sasrt_region_cpu_reserve_mb, bytes; 0: plume's 32 MB).
+extern std::atomic<uint32_t> g_cpu_free_mb;
+bool CpuGovernorOn();
+uint32_t CpuLowMarkMb();
+uint64_t RegionCpuReserveBytes();
 bool MemoryLow();
 bool MemoryCritical();
 // sasrt-nx (2026-11-09 night, sasrt_memory_emergency): the governor's looks left in an emergency (a texture or a block

@@ -47,12 +47,14 @@ REXCVAR_DEFINE_INT32(banjo_renut_dynamic_handheld_low, 540, "Nuts&Bolts/Graphics
 REXCVAR_DEFINE_INT32(banjo_renut_dynamic_handheld_high, 720, "Nuts&Bolts/Graphics",
                      "banjo_renut_dynamic_resolution: the handheld range's high height")
     .range(360, 1080);
-REXCVAR_DEFINE_INT32(banjo_renut_dynamic_docked_low, 720, "Nuts&Bolts/Graphics",
+// sasrt-nx 1.0.1 (2026-11-24, the user: "make the game dynamic 720p in both handheld and docked 540p-720p by default"):
+// docked 540 to 720 (720 to 1080 before; app/sasrt_switch.toml has why), the 3D upscaled to the 1080 display.
+REXCVAR_DEFINE_INT32(banjo_renut_dynamic_docked_low, 540, "Nuts&Bolts/Graphics",
                      "banjo_renut_dynamic_resolution: the docked range's low height")
     .range(360, 1080);
-REXCVAR_DEFINE_INT32(banjo_renut_dynamic_docked_high, 1080, "Nuts&Bolts/Graphics",
+REXCVAR_DEFINE_INT32(banjo_renut_dynamic_docked_high, 720, "Nuts&Bolts/Graphics",
                      "banjo_renut_dynamic_resolution: the docked range's high height (a multiple of 9; 1080 is the "
-                     "docked display's own size, 900 before night_gpu5)")
+                     "docked display's own size, 900 before night_gpu5; sasrt-nx 1.0.1: 720, as handheld)")
     .range(360, 1080);
 REXCVAR_DEFINE_INT32(banjo_renut_dynamic_steps, 4, "Nuts&Bolts/Graphics",
                      "banjo_renut_dynamic_resolution (night_gpu5, the user's request): heights between each range's low "
@@ -68,7 +70,7 @@ REXCVAR_DEFINE_INT32(sasrt_dynamic_lines_handheld, 36, "SASRT/Graphics",
                      "multiple of 9; 36 banjo's)")
     .range(9, 72)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_INT32(sasrt_dynamic_lines_docked, 36, "SASRT/Graphics",
+REXCVAR_DEFINE_INT32(sasrt_dynamic_lines_docked, 18, "SASRT/Graphics",  // sasrt-nx 1.0.1: 18, as handheld (36)
                      "banjo_renut_dynamic_resolution: the docked steps are multiples of this many lines (9 to 72, a "
                      "multiple of 9; 36 banjo's)")
     .range(9, 72)
@@ -235,9 +237,15 @@ plume::RenderFormat SurfaceColorFormat(const d3d::SurfaceDesc &desc) {
 // change and builds the steps again).
 bool DynamicResolutionOn() { return REXCVAR_GET(banjo_renut_dynamic_resolution); }
 int32_t DynamicHeight(bool docked, bool high) {
-  return docked ? int32_t(high ? REXCVAR_GET(banjo_renut_dynamic_docked_high) : REXCVAR_GET(banjo_renut_dynamic_docked_low))
-                : int32_t(high ? REXCVAR_GET(banjo_renut_dynamic_handheld_high)
-                               : REXCVAR_GET(banjo_renut_dynamic_handheld_low));
+  const int32_t set =
+      docked ? int32_t(high ? REXCVAR_GET(banjo_renut_dynamic_docked_high) : REXCVAR_GET(banjo_renut_dynamic_docked_low))
+             : int32_t(high ? REXCVAR_GET(banjo_renut_dynamic_handheld_high)
+                            : REXCVAR_GET(banjo_renut_dynamic_handheld_low));
+  // sasrt-nx 1.0.1 (2026-11-24, the user: "Clamp dynamic resolution the config so it cant go above 720p"): neither end
+  // of either range above 720 lines, whatever the toml or the game menu says (docked's 720-1080 ran heavy events out of
+  // memory; out/console_runs/c1124_101). The fixed heights (dynamic resolution off) are not clamped.
+  constexpr int32_t kDynamicMax = 720;
+  return set > kDynamicMax ? kDynamicMax : set;
 }
 double DynamicUpSeconds() {
   static const double set = double(REXCVAR_GET(banjo_renut_dynamic_up_s));

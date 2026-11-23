@@ -2,7 +2,7 @@
 
 <h1 align=center>Sonic &amp; All-Stars Racing Transformed: Nintendo Switch port</h1>
 
-<p align=center><b>sasrt-nx 1.0.0</b> · <a href="https://chanseyisthebest.github.io/sasrt-nx-installer/">web installer</a> · <a href="https://github.com/ChanseyIsTheBest/sasrt-nx/releases/tag/v1.0.0">release</a></p>
+<p align=center><b>sasrt-nx 1.0.1</b> · <a href="https://chanseyisthebest.github.io/sasrt-nx-installer/">web installer</a> · <a href="https://github.com/ChanseyIsTheBest/sasrt-nx/releases/tag/v1.0.1">release</a></p>
 
 An unofficial native port of the Xbox 360 version of **Sonic & All-Stars Racing Transformed** (title `5345085D`), first
 to Windows PC and then to the Nintendo Switch, by static recompilation with [ReXGlue](https://github.com/rexglue/rexglue-sdk).
@@ -21,20 +21,22 @@ Demand package `5345085D/00007000/97A9A171AADA666596EA` with its `.data` folder 
 See [docs/plan.md](docs/plan.md) for the stages and their state, and [docs/sasrt-notes.md](docs/sasrt-notes.md) for
 what was found in the game's code, each finding with its evidence.
 
-## Playing it on the Switch (1.0.0)
+## Playing it on the Switch (1.0.1)
 
-**Version 1.0.0** by ChanseyIsTheBest. Make the Switch package from your own copy of the game with the web installer:
+**Version 1.0.1** by ChanseyIsTheBest. Make the Switch package from your own copy of the game with the web installer:
 **https://chanseyisthebest.github.io/sasrt-nx-installer/** (source: [sasrt-nx-installer](https://github.com/ChanseyIsTheBest/sasrt-nx-installer)).
 It runs in your browser: it reads the disc image, the Games on Demand package or the extracted folder, makes the game's
 shaders for the Switch from your files (translated and compiled in the browser), re-encodes the movies to H.265 and the
 sounds to Opus, packs the archives, and downloads `sasrt-nx.zip` to extract to the root of the SD card. The NRO is in
-[the 1.0.0 release](https://github.com/ChanseyIsTheBest/sasrt-nx/releases/tag/v1.0.0) and in the installer.
+[the 1.0.1 release](https://github.com/ChanseyIsTheBest/sasrt-nx/releases/tag/v1.0.1) and in the installer.
 
 What the release does, in short:
 
 - Single player, story mode and split screen for 2 to 4 players; the Bonus Pack DLC when you add it to the installer.
-- A Renut renderer on deko3d (the Switch's own GPU API) with dynamic resolution; 30 fps cap by default (the game's own
-  pace), adjustable up to 60 in the game's menu.
+- A Renut renderer on deko3d (the Switch's own GPU API) with dynamic resolution, 540p to 720p in both handheld and
+  docked mode (docked upscaled to the TV's 1080p; since 1.0.1, after 720p-1080p ran heavy docked events out of memory,
+  and capped at 720p whatever the settings say);
+  30 fps cap by default (the game's own pace), adjustable up to 60 in the game's menu.
 - Four CPU cores when started from a Sphaira forwarder (see the installer's page).
 - Every log off but the crash report (`switch/sasrt-nx/logs/rex/rex_crash.log`); for a bug report set
   `log_level = "info"` at the top of `switch/sasrt-nx/sasrt.toml`.

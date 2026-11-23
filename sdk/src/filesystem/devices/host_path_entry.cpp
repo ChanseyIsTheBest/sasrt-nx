@@ -149,8 +149,12 @@ HostPathEntry::~HostPathEntry() {
 
 HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
                                      const std::filesystem::path& full_path,
-                                     rex::filesystem::FileInfo file_info) {
+                                     rex::filesystem::FileInfo file_info, const IndexHint* hint) {
   std::string name = rex::path_to_utf8(file_info.name);
+  // sasrt-nx 1.0.1 (base port 264): from the VFS index, the full scan's decisions are taken as they are (below), with
+  // no SD access here.
+  const bool scan = hint == nullptr;
+  const uint64_t disk_size = file_info.total_size;
   /*
    * rr6-nx (2026-11-10): NAME.lz4b is the game's NAME (rex/filesystem/lz4_blocks.h), with the size of the file it
    * holds, unless a plain NAME lies next to it (an install extracted over an older one): the plain file wins and the
@@ -161,7 +165,7 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
   // rr6-nx (2026-11-21): NAME.hevc.lz4b (rex/filesystem/sfd_hevc.h, a .hevc movie stored as ZXC blocks) is the game's
   // NAME as NAME.hevc is, unless a plain NAME lies next to it; OpenSfdHevc reads it through OpenLz4Blocks.
   const bool packed_hevc_name =
-      file_info.type == rex::filesystem::FileInfo::Type::kFile && HasLz4BlocksSuffix(name) &&
+      scan && file_info.type == rex::filesystem::FileInfo::Type::kFile && HasLz4BlocksSuffix(name) &&
       HasSfdHevcSuffix(std::string_view(name).substr(0, name.size() - kLz4BlocksSuffix.size()));
   bool packed_hevc = false;
   uint64_t packed_hevc_size = 0;
@@ -182,7 +186,7 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
   }
   // sasrt-nx (2026-11-21): NAME.xmop.lz4b (rex/filesystem/xmo.h, a .xmop package stored as ZXC blocks) the same way.
   const bool packed_xmop_name =
-      file_info.type == rex::filesystem::FileInfo::Type::kFile && HasLz4BlocksSuffix(name) &&
+      scan && file_info.type == rex::filesystem::FileInfo::Type::kFile && HasLz4BlocksSuffix(name) &&
       HasXmopSuffix(std::string_view(name).substr(0, name.size() - kLz4BlocksSuffix.size()));
   bool packed_xmop = false;
   uint64_t packed_xmop_size = 0;
@@ -201,7 +205,7 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
       REXFS_WARN("{} is not a valid packed .xmop package: left as it is", rex::path_to_utf8(full_path));
     }
   }
-  if (!packed_hevc_name && !packed_xmop_name && file_info.type == rex::filesystem::FileInfo::Type::kFile &&
+  if (scan && !packed_hevc_name && !packed_xmop_name && file_info.type == rex::filesystem::FileInfo::Type::kFile &&
       HasLz4BlocksSuffix(name)) {
     std::filesystem::path plain = full_path;
     plain.replace_extension();
@@ -219,7 +223,8 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
   // culdcept-nx (2026-11-20): NAME.xmo (rex/filesystem/xmo.h, an XMA file whose frames are Opus) the same way; sasrt-nx
   // (2026-11-21): and NAME.xmop (a Wwise package whose XMA2 sounds are Opus).
   bool xmo = false, xmop = false;
-  if (file_info.type == rex::filesystem::FileInfo::Type::kFile && (HasXmoSuffix(name) || HasXmopSuffix(name))) {
+  if (scan && file_info.type == rex::filesystem::FileInfo::Type::kFile &&
+      (HasXmoSuffix(name) || HasXmopSuffix(name))) {
     const bool pack = HasXmopSuffix(name);
     std::filesystem::path plain = full_path;
     plain.replace_extension();
@@ -236,7 +241,7 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
   }
   // rr6-nx (2026-11-21): NAME.hevc (rex/filesystem/sfd_hevc.h, a movie as H.265) the same way.
   bool sfd_hevc = false;
-  if (file_info.type == rex::filesystem::FileInfo::Type::kFile && HasSfdHevcSuffix(name)) {
+  if (scan && file_info.type == rex::filesystem::FileInfo::Type::kFile && HasSfdHevcSuffix(name)) {
     std::filesystem::path plain = full_path;
     plain.replace_extension();
     rex::filesystem::FileInfo plain_info;
@@ -258,12 +263,21 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
     xmop = true;
     lz4_size = packed_xmop_size;
   }
+  if (hint && hint->kinds && file_info.type == rex::filesystem::FileInfo::Type::kFile) {
+    lz4_blocks = (hint->kinds & kIndexLz4Blocks) != 0;
+    xmo = (hint->kinds & kIndexXmo) != 0;
+    xmop = (hint->kinds & kIndexXmop) != 0;
+    sfd_hevc = (hint->kinds & kIndexSfdHevc) != 0;
+    lz4_size = hint->size;
+    name = hint->guest_name;
+  }
   auto path = rex::string::utf8_join_guest_paths(parent->path(), name);
   auto entry = new HostPathEntry(device, parent, path, full_path);
   entry->lz4_blocks_ = lz4_blocks;
   entry->xmo_ = xmo;
   entry->xmop_ = xmop;
   entry->sfd_hevc_ = sfd_hevc;
+  entry->disk_size_ = disk_size;
   if (lz4_blocks || xmo || xmop || sfd_hevc) {
     file_info.total_size = size_t(lz4_size);
   }
@@ -389,6 +403,7 @@ bool HostPathEntry::Truncate() {
   if (rex::filesystem::TruncateOpenFile(host_path_)) {
     size_ = 0;
     allocation_size_ = 0;
+    disk_size_ = 0;  // sasrt-nx 1.0.1 (base port 264): the SD's size, which the VFS index keeps
     return true;
   }
 #endif
@@ -399,6 +414,7 @@ bool HostPathEntry::Truncate() {
   fclose(file);
   size_ = 0;
   allocation_size_ = 0;
+  disk_size_ = 0;
   return true;
 }
 
@@ -464,6 +480,7 @@ void HostPathEntry::update() {
     return;
   }
   if (file_info.type == rex::filesystem::FileInfo::Type::kFile) {
+    disk_size_ = file_info.total_size;  // sasrt-nx 1.0.1 (base port 264): the SD's size, before a stand-in's below
     if (lz4_blocks_) {  // rr6-nx: the size of the file it holds
       uint64_t size = 0;
       if (!ReadLz4BlocksSize(host_path_, &size)) {
