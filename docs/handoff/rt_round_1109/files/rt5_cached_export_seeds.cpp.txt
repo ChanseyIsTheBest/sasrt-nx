@@ -1,0 +1,42 @@
+// RT5 (sasrt_rt_cached_export_seeds), sasrt-nx 2026-11-09. plume_deko3d.cpp, Deko3DBuffer::Deko3DBuffer:
+            return;
+        gpu = dkMemBlockGetGpuAddr(block);
+        cpu = static_cast<uint8_t *>(dkMemBlockGetCpuAddr(block));
+        // No line of the memory (from whatever used it before) may be dirty in the CPU's caches: one written back over the
+        // GPU's results later would lose them. The CPU never writes a readback buffer after this.
+        // sasrt-nx (2026-11-09, sasrt_rt_cached_export_seeds): a cached upload buffer the GPU writes too (the memexport
+        // windows, which the CPU seeds) needs the same: every cached buffer gets it (once, at creation).
+        if (cpuCached)
+            armDCacheFlush(cpu, size_t(size));
+        g_deko3dStats.bufferBytes += size;
+        {
+// draw.cpp, MemExportBufferSlowLocked:
+plume::RenderBuffer *MemExportBufferSlowLocked(VideoState &s, uint64_t size) {
+  auto &buffer = s.memexport_buffer[s.frame];
+  const bool had = buffer && s.memexport_capacity[s.frame] >= size;
+  // sasrt-nx (2026-11-09, sasrt_rt_cached_export_seeds): CPU-cached (the key as latched: a buffer keeps its memory type,
+  // so the A/B half does not decide it).
+  const bool cached = IsDeko3D() && sasrt::gpu_round::g_latched.on[sasrt::gpu_round::kRtCachedExportSeeds];
+  if (!EnsureBuffer(buffer, s.memexport_capacity[s.frame], size,
+                    cached ? plume::RenderBufferDesc::UploadBuffer(0, StorageBufferFlags() | AddressableBufferFlags() |
+                                                                          plume::RenderBufferFlag::HOST_CACHED)
+                           : plume::RenderBufferDesc::DefaultBuffer(
+                                 0, StorageBufferFlags() | AddressableBufferFlags()),
+                    "renut memexport buffer")) {
+    return nullptr;
+  }
+// draw.cpp, SasrtSeedExportsCpuLocked (the loop):
+      return false;
+  }
+  for (u32 k = 0; k < count; ++k) {
+    const MemExportStream &f = fresh[indices[k]];
+    std::memcpy(window + fresh_offsets[indices[k]], guests[k], f.size);
+    g_seed_bytes += f.size;  // banjo-nx (2026-10-26): the 10 s line's
+    // sasrt-nx (2026-11-09, sasrt_rt_cached_export_seeds): the seed's lines cleaned when the buffer is CPU-cached (plume's
+    // unmap cleans the written range then; on uncached memory it does nothing, as before).
+    const plume::RenderRange written(fresh_offsets[indices[k]], uint64_t(fresh_offsets[indices[k]]) + f.size);
+    buffer->unmap(0, &written);
+  }
+  sasrt::gpu_round::Count(sasrt::gpu_round::kSeedCpu, count);
+  return true;
+#else

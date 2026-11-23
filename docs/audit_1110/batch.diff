@@ -1,0 +1,526 @@
+--- before/app/src/cpu/banjo_hot_guest.h
++++ after/app/src/cpu/banjo_hot_guest.h
+@@ -104,6 +104,21 @@
+ #define BANJO_HOT_COUNTED(ID) &n_##ID::NativeCounted
+ #endif
+ 
++// sasrt-nx (2026-11-10, machine-copy idea 27): the guard's two forms of every copy (the copy's logged form and the
++// original statements' logged form, about two thirds of the copies' code) are made only with BANJO_HOT_GUARD_FORMS
++// (CMake SASRT_HOT_GUARD_FORMS, ON by default; a shipping build without the guard turns it OFF). Without them every
++// hook calls its copy directly (InitHook), whatever banjo_hot_guard_* say.
++#ifndef BANJO_HOT_GUARD_FORMS
++#define BANJO_HOT_GUARD_FORMS 1
++#endif
++#if BANJO_HOT_GUARD_FORMS
++#define BANJO_HOT_LOGGED(ID) &n_##ID::NativeLogged
++#define BANJO_HOT_REFERENCE(ID) &n_##ID::ReferenceLogged
++#else
++#define BANJO_HOT_LOGGED(ID) nullptr
++#define BANJO_HOT_REFERENCE(ID) nullptr
++#endif
++
+ // SYM: the generated function's name; ID: the namespace suffix of its header (n_<ID>); KEY: its cvar; SLOT: its
+ // PPCContext::host_counters slot. Written by tools/localize_native.py (app/generated/hot/banjo_hot_list.inc, and
+ // banjo_hot_bulk_<k>.inc for the bulk list: BANJO_HOT_HOOK_BULK, its keys in a category of their own).
+@@ -115,7 +130,7 @@
+   REXCVAR_DEFINE_BOOL(KEY, DEFAULT, CATEGORY, DESC).lifecycle(rex::cvar::Lifecycle::kInitOnly);                  \
+   REX_EXTERN(__imp__##SYM);                                                                                      \
+   namespace banjo::hot {                                                                                         \
+-  Hook g_hook_##ID{#SYM, #KEY, &__imp__##SYM, &n_##ID::Native, &n_##ID::NativeLogged, &n_##ID::ReferenceLogged,  \
++  Hook g_hook_##ID{#SYM, #KEY, &__imp__##SYM, &n_##ID::Native, BANJO_HOT_LOGGED(ID), BANJO_HOT_REFERENCE(ID),    \
+                    BANJO_HOT_COUNTED(ID), n_##ID::g_hits, uint32_t(std::size(n_##ID::g_hits)), n_##ID::kCode,    \
+                    uint32_t(std::size(n_##ID::kCode)), n_##ID::kCodeHash, [] { return bool(REXCVAR_GET(KEY)); }, \
+                    SLOT, &n_##ID::kSkip, BULK};                                                                  \
+--- before/app/src/cpu/banjo_hot_guest.cpp
++++ after/app/src/cpu/banjo_hot_guest.cpp
+@@ -347,8 +347,16 @@
+   h.verify = verify;
+   h.guard_calls = uint32_t(std::clamp(REXCVAR_GET(banjo_hot_guard_calls), 0, 4000));
+   h.period = period;
+-  // No guard at all: the hook calls its copy directly (banjo_hot_guest.h, kDirect).
+-  const bool direct = !verify && h.guard_calls == 0 && REXCVAR_GET(banjo_hot_guard_period) == 0;
++  // No guard at all: the hook calls its copy directly (banjo_hot_guest.h, kDirect). sasrt-nx (2026-11-10, machine-copy
++  // idea 27): also when the build has no guard forms (BANJO_HOT_GUARD_FORMS 0: the logged forms are not made).
++  const bool forms = h.native_logged && h.reference_logged;
++  if (!forms && (verify || h.guard_calls || REXCVAR_GET(banjo_hot_guard_period))) {
++    static std::atomic<bool> said{false};
++    if (!said.exchange(true, std::memory_order_relaxed))
++      REXLOG_WARN("[hot] this build has no guard forms (SASRT_HOT_GUARD_FORMS OFF): sasrt_cpu_verify and "
++                  "banjo_hot_guard_* are ignored, every native copy is called directly");
++  }
++  const bool direct = !forms || (!verify && h.guard_calls == 0 && REXCVAR_GET(banjo_hot_guard_period) == 0);
+   uint8_t state = on ? (direct ? kDirect : kOn) : kOff;
+   if (on && REXCVAR_GET(banjo_hot_count) && h.native_counted) state = kCount;
+   if (on && h.bulk) {
+--- before/app/CMakeLists.txt
++++ after/app/CMakeLists.txt
+@@ -287,6 +287,21 @@
+ # sasrt-nx (2026-11-08): the localized copies' merged vector stores (tools/localize_native.py merge_vector_stores: an
+ # stvlx/stvrx pair, or four stvewx of one vector, as one 16-byte store of the same bytes). OFF: the original stores.
+ option(SASRT_HOT_MERGED_STORES "Localized copies: merged unaligned vector stores (tools/localize_native.py)" ON)
++# sasrt-nx (2026-11-10, machine-copy idea 27): the guard's logged forms of every localized copy. OFF (a shipping build
++# that runs no guard): about two thirds of the copies' code is not made; every hook calls its copy directly.
++option(SASRT_HOT_GUARD_FORMS "Localized copies: the guard's logged forms (banjo_hot_guard_*, sasrt_cpu_verify)" ON)
++if(NOT SASRT_HOT_GUARD_FORMS)
++    target_compile_definitions(sasrt PRIVATE BANJO_HOT_GUARD_FORMS=0)
++endif()
++# sasrt-nx (2026-11-10, machine-copy idea 58): tools/localize_native.py puts the bulk copies with fewer than 3 console
++# samples in shards 6-11; with this option those shards are compiled for size (-Os), the hot ones as before.
++option(SASRT_HOT_COLD_SHARDS "Localized copies: the cold bulk shards (6-11) compiled for size" ON)
++if(SASRT_HOT_COLD_SHARDS)
++    set_source_files_properties(
++        src/cpu/banjo_hot_shard_6.cpp src/cpu/banjo_hot_shard_7.cpp src/cpu/banjo_hot_shard_8.cpp
++        src/cpu/banjo_hot_shard_9.cpp src/cpu/banjo_hot_shard_10.cpp src/cpu/banjo_hot_shard_11.cpp
++        PROPERTIES COMPILE_OPTIONS "-Os")
++endif()
+ if(NOT SASRT_HOT_MERGED_STORES)
+     target_compile_definitions(sasrt PRIVATE SASRT_HOT_MERGED_STORES_OFF)
+ endif()
+--- before/tools/localize_native.py
++++ after/tools/localize_native.py
+@@ -69,13 +69,19 @@
+ LIST = os.path.join(APP, 'src', 'cpu', 'hot', 'localized.txt')
+ BULK = os.path.join(APP, 'src', 'cpu', 'hot', 'localized_bulk.txt')
+ SHARDS = 12  # app/src/cpu/banjo_hot_shard_<k>.cpp (app/CMakeLists.txt lists them)
++# sasrt-nx (2026-11-10, machine-copy idea 58): the bulk copies with at least HOT_SAMPLES console samples go to the
++# first HOT_SHARDS shards, the rest to the others (app/CMakeLists.txt, SASRT_HOT_COLD_SHARDS: the cold shards for
++# size). The samples are read from the list's description ("N console samples").
++HOT_SHARDS = 6
++HOT_SAMPLES = int(os.environ.get('SASRT_HOT_SAMPLES', '3'))
++HOT_CLOSURE_SAMPLES = int(os.environ.get('SASRT_HOT_CLOSURE_SAMPLES', '20'))  # machine-copy idea 33 (localize)
+ BULK_SLOT = 9999  # past PPCContext::host_counters: the guard's countdown is the hook's own (banjo_hot_guest.h)
+ # sasrt-nx (2026-11-08): the first slots belong to the hooks of app/src/hot/sasrt_hot_guest.cpp (the CRT and Direct3D
+ # natives, slots given at their first call, at most sasrt::hot::kCtxSlots = 8); the localized list's hooks follow.
+ SLOT_BASE = 8
+ HAND = os.path.join(APP, 'src', 'cpu', 'hot', 'hand.txt')
+ IMAGE_BASE = 0x82000000
+-INDEX_FORMAT = 9  # raise when summarise() changes: the cached index is rebuilt (5: carded vector stores; 6, 7: inline leaves; 8: r1 mirror, 2026-10-23; 9: atomics, sasrt-nx 2026-11-10)
++INDEX_FORMAT = 10  # raise when summarise() changes: the cached index is rebuilt (5: carded vector stores; 6, 7: inline leaves; 8: r1 mirror, 2026-10-23; 9: atomics, 10: the time base, sasrt-nx 2026-11-10)
+ 
+ REG = re.compile(r'\bctx\.(r\d+|f\d+|v\d+|cr\d|ctr|xer|reserved)\b')
+ DEF = re.compile(r'^DEFINE_REX_FUNC\((\w+)\) \{$')
+@@ -114,17 +120,20 @@
+ # logged run ends before the first one (the call is then not compared, as for a call outside the copy), and in the
+ # running form Open() is a constant false. log2f is a pure function. SASRT_LOCALIZE_ATOMICS=0: refused, as before.
+ ATOMICS = os.environ.get('SASRT_LOCALIZE_ATOMICS', '1') != '0'
+-ATOMIC_SPECIAL = {'reserved', 'REX_GUEST_CAS', 'std::atomic_thread_fence', 'log2f'}
++ATOMIC_SPECIAL = {'reserved', 'REX_GUEST_CAS', 'std::atomic_thread_fence', 'log2f', 'REX_QUERY_TIMEBASE'}
+ ATOMIC_HOST = {'std::atomic_thread_fence', 'log2f'}
+ ATOMIC_LOAD = re.compile(r'^\t+reserved\.u(?:32|64) = \*\(uint(?:32|64)_t\*\)REX_RAW_ADDR\(ea\);$')
+ ATOMIC_CAS = re.compile(r'^\t+[\w.]+\.eq = REX_GUEST_CAS(?:_C)?\((?:ea, )?reinterpret_cast<uint(?:32|64)_t\*>\(REX_RAW_ADDR\(ea\)\), '
+                         r'reserved\.s(?:32|64), __builtin_bswap(?:32|64)\([\w.]+\.s(?:32|64)\)\);$')
+ ATOMIC_FENCE = re.compile(r'^\t+std::atomic_thread_fence\(std::memory_order_\w+\);$')
++# sasrt-nx (2026-11-10, machine-copy idea 41): a time-base read (mftb) the same way: the running form reads the clock,
++# the guard's forms stop before it (a second run would read another time and differ for nothing).
++ATOMIC_TIME = re.compile(r'^\t+[\w.]+\.u64 = REX_QUERY_TIMEBASE\(\);$')
+ 
+ 
+ def atomic_stop(l):
+     """A reservation load, compare-and-swap or fence, with the guard's stop in front (see ATOMICS)."""
+-    if not ATOMICS or not (ATOMIC_LOAD.match(l) or ATOMIC_CAS.match(l) or ATOMIC_FENCE.match(l)):
++    if not ATOMICS or not (ATOMIC_LOAD.match(l) or ATOMIC_CAS.match(l) or ATOMIC_FENCE.match(l) or ATOMIC_TIME.match(l)):
+         return l
+     stripped = l.lstrip('\t')
+     return l[:len(l) - len(stripped)] + '{ if (s.Open()) return; ' + stripped + ' }'
+@@ -887,8 +896,13 @@
+         sys.exit(f'localize_native: {root} cannot be a copy: {why}')
+     if hooks.replaced(root):
+         sys.exit(f'localize_native: {root} is mentioned by an app or SDK source: a hook may replace it already')
+-    max_lines = int(opts.get('closure', 6000))
+-    members, left_out = closure_of(index, hooks, root, max_lines, int(opts.get('member', 1200)))
++    # sasrt-nx (2026-11-10, machine-copy idea 33): a hot copy (at least HOT_CLOSURE_SAMPLES console samples in its list
++    # line) takes twice the callees' lines into its closure (12,000 lines, members up to 2,400), so more of its calls are
++    # inlined copies; an explicit closure= / member= in the list wins. SASRT_HOT_CLOSURE_SAMPLES=0: as before.
++    hot = re.search(r'(\d+) console samples', what or '')
++    big = bool(HOT_CLOSURE_SAMPLES and hot and int(hot.group(1)) >= HOT_CLOSURE_SAMPLES)
++    max_lines = int(opts.get('closure', 12000 if big else 6000))
++    members, left_out = closure_of(index, hooks, root, max_lines, int(opts.get('member', 2400 if big else 1200)))
+     member_set = set(members)
+     externs = set()
+     stats = {'calls_closed': 0, 'calls_open': 0, 'synced': []}
+@@ -1205,10 +1219,17 @@
+         inc.append(f'BANJO_HOT_HOOK({root}, {rid}, {key_of(root, opts)}, {"false" if opts.get("off") else "true"}, '
+                    f'{SLOT_BASE + slot}, "{desc}")')
+     # The bulk list over the shards: the largest headers first, each to the shard with the fewest bytes so far.
++    # sasrt-nx (2026-11-10, machine-copy idea 58): the hot copies over the first HOT_SHARDS shards, the cold over the rest.
+     shards = [[0, []] for _ in range(SHARDS)]
++
++    def samples(what):
++        m = re.search(r'(\d+) console samples', what)
++        return int(m.group(1)) if m else HOT_SAMPLES
++
+     for root, opts, what in sorted(bulk, key=lambda e: -os.path.getsize(os.path.join(out_dir, f'n_{identifier(e[0])}.h'))):
+         rid = identifier(root)
+-        shard = min(shards, key=lambda s: s[0])
++        group = shards[:HOT_SHARDS] if samples(what) >= HOT_SAMPLES else shards[HOT_SHARDS:]
++        shard = min(group, key=lambda s: s[0])
+         shard[0] += os.path.getsize(os.path.join(out_dir, f'n_{rid}.h'))
+         desc = ('Bulk localized copy of %s: %s' % (root, what)).replace('\\', '/').replace('"', "'")
+         shard[1] += [f'#include "n_{rid}.h"',
+--- before/tools/switch_hot_bulk.py
++++ after/tools/switch_hot_bulk.py
+@@ -116,6 +116,14 @@
+     ap.add_argument('--merge', action='store_true', help='with --write: keep what the list has and add to it')
+     ap.add_argument('--min-samples', type=float, default=3)
+     ap.add_argument('--tiny', type=int, default=12, help='leaves of at most this many guest instructions stay out')
++    # sasrt-nx (2026-11-10, machine-copy idea 30, runs cp3/cp4 against lat12): a small function as a copy loses. Behind its
++    # hook its callers no longer inline it (LTO did) and every call hands the registers over: SASRT's copies of fewer
++    # than 40 guest instructions cost 0.049 -> 0.142 samples a frame (+188 %), the larger ones less. They stay out unless
++    # very hot; with --merge the list's own lines that break the rule are taken out too.
++    ap.add_argument('--min-instructions', type=int, default=40,
++                    help='functions of fewer guest instructions stay out (0: no limit, as before)')
++    ap.add_argument('--small-keep-samples', type=int, default=50,
++                    help='... unless they have at least this many console samples')
+     a = ap.parse_args()
+     if len(a.pairs) % 2:
+         ap.error('PROFILE ELF pairs')
+@@ -172,6 +180,8 @@
+             why = 'already a native'
+         elif not f['callees'] and not f['unknown'] and sizes.get(sub, (0, 4 * (a.tiny + 1)))[1] // 4 <= a.tiny:
+             why = 'tiny leaf'
++        elif a.min_instructions and sizes.get(sub, (0, 0))[1] // 4 < a.min_instructions and n < a.small_keep_samples:
++            why = f'small (under {a.min_instructions} instructions: its callers inline it)'
+         elif hooks.replaced(sub):
+             why = 'an app or SDK source mentions it'
+         elif sub in threaded:
+@@ -199,6 +209,16 @@
+         have = {m.group(1).upper() for l in kept for m in [re.match(r'\s*([0-9A-Fa-f]{8})\b', l)] if m}
+         rows = [r for r in rows if r[0][4:].upper() not in have]
+         lines = [l for l in kept if l.strip()]
++        # sasrt-nx (2026-11-10, idea 30): the list's own small lines out too (their size and samples are on the line).
++        if a.min_instructions:
++            pruned = []
++            for l in lines:
++                m = re.match(r'\s*([0-9A-Fa-f]{8}) (\d+) console samples, (\d+) instructions', l)
++                if m and int(m.group(3)) < a.min_instructions and int(m.group(2)) < a.small_keep_samples:
++                    left['small, taken out of the list'] += 1
++                    continue
++                pruned.append(l)
++            lines = pruned
+     for sub, n, ins, calls in rows:
+         lines.append(f'{sub[4:]} {n} console samples, {ins} instructions, {calls} direct callees')
+     open(a.write, 'w', encoding='utf-8', newline='\n').write('\n'.join(lines) + '\n')
+--- before/tools/win/build_switch.ps1
++++ after/tools/win/build_switch.ps1
+@@ -12,7 +12,10 @@
+     # sasrt-nx (2026-11-09): PGO (docs/pgo-lto.md): -Pgo generate builds the instrumented NRO in out\nx-pgo-gen, -Pgo use
+     # the optimised one in out\nx-pgo-use (with -Final: LTO too). -Build names another folder.
+     [string]$Pgo = '',
+-    [string]$Build = ''
++    [string]$Build = '',
++    # sasrt-nx (2026-11-10, machine-copy idea 27): -Final (the shipping build) leaves the localized copies' guard forms out
++    # (SASRT_HOT_GUARD_FORMS OFF: no guard, every copy called directly); -GuardForms keeps them (a guard / verify build).
++    [switch]$GuardForms
+ )
+ $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+ . (Join-Path $PSScriptRoot 'env.ps1')  # VS CMake and Ninja on PATH (the compilers come from the toolchain file)
+@@ -48,7 +51,14 @@
+     & cmake "-DSASRT_PGO=$Pgo" $build
+     if ($LASTEXITCODE) { exit $LASTEXITCODE }
+ }
+-Write-Output "sasrt: Switch build in $folder, LTO $lto, PGO '$Pgo' (cache before: LTO $cached, PGO '$cachedPgo')"
++$forms = if ($Final -and -not $GuardForms) { 'OFF' } else { 'ON' }
++$cachedForms = Select-String -Path (Join-Path $build 'CMakeCache.txt') -Pattern '^SASRT_HOT_GUARD_FORMS:BOOL=(.*)$' |
++    ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1
++if ("$cachedForms" -ne $forms) {
++    & cmake "-DSASRT_HOT_GUARD_FORMS=$forms" $build
++    if ($LASTEXITCODE) { exit $LASTEXITCODE }
++}
++Write-Output "sasrt: Switch build in $folder, LTO $lto, PGO '$Pgo', guard forms $forms (cache before: LTO $cached, PGO '$cachedPgo', guard forms '$cachedForms')"
+ # The LTO link (SASRT_SWITCH_LTO) runs its LTRANS partitions through `make` when lto-wrapper finds one, in parallel
+ # (-flto=N); without one it compiles all 512 serially (about 20 minutes here). devkitPro's MSYS2 make, appended to the
+ # end of PATH so it shadows nothing.
+--- before/app/src/renut_engine/gpu/backend/queued.cpp
++++ after/app/src/renut_engine/gpu/backend/queued.cpp
+@@ -29,6 +29,7 @@
+ #include "renut_engine/gpu/render/surfaces.h"
+ #include "renut_engine/gpu/sa2_line_compare.h"
+ #include "renut_engine/gpu/line_compare.h"  // sasrt-nx (2026-11-08): the base's, with the delta masks
++#include "renut_engine/gpu/d3d/d3d_native.h"  // sasrt-nx (2026-11-10, sasrt_capture_marks): the marks and the tags
+ 
+ #include <chrono>
+ 
+@@ -218,6 +219,25 @@
+                     "instead of 2,048. Bangai-O's missile storms queue ~4,250 draws a frame: past 2,048 the pool deleted "
+                     "and made again ~2,200 captures a frame. Same data. In-run A/B target 82 (70 in bangaio-nx)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++// sasrt-nx (2026-11-10, item 24 for the game's own draws: SlRenderer's CaptureDelta was 9 % of that thread, run lat12).
++// Each draw on the title device compared the device's 40 read chunks with the chain's shadow. With this key the title
++// device gets a mark slot too (d3d/hooks/device.cpp) and a delta compares only the chunks marked since the chain's last
++// draw: D3D's own dirty tags (m_Pending words 2-4, read before the delta clears them, native::TagChunks), the native
++// layer's marks, and the chunks run tv1 found written without a tag (the tile predication words and the pixel shader
++// pointer). Every sasrt_capture_marks_check-th delta compares all of them and checks that nothing changed unmarked: a
++// change found is logged and the marks are not used again (1: every delta compared whole, each such chunk logged once).
++REXCVAR_DEFINE_BOOL(sasrt_capture_marks, false, "SASRT/Recording",
++                    "The game's own draws (CaptureDelta, SlRenderer): a delta compares only the device chunks marked "
++                    "or tagged since the chain's previous draw instead of every read chunk (the title device gets a mark "
++                    "slot). Off: every read chunk compared (as before)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_INT32(sasrt_capture_marks_check, 32, "SASRT/Recording",
++                     "sasrt_capture_marks: every Nth delta compares every read chunk and checks the marks (a chunk changed "
++                     "without one: logged, and the marks are not used again). 1: the verify form (every delta compared "
++                     "whole, each such chunk logged once, the marks kept). 0: never checked")
++    .range(0, 1 << 20)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ // bangaio-nx (2026-10-29): see DeltaRuns.
+ REXCVAR_DEFINE_BOOL(banjo_renut_delta_masks, true, "Banjo/Enhancements",
+                     "Renut's renderer on the Switch (banjo_renut_snapshot_deltas): the game thread finds a draw's "
+@@ -616,8 +636,20 @@
+   // bangaio-nx (2026-10-29, banjo_renut_small_captures): each delta is written here, then copied into its capture at its
+   // size. The same lines every draw: they stay in the game thread's cache.
+   alignas(64) u8 scratch[kDeltaMaxBytes];
++  // sasrt-nx (2026-11-10, sasrt_capture_marks): the marks were taken at the chain's last draw (a delta may use them),
++  // deltas since the last whole check, and the 10 s report's counts.
++  bool marks_primed = false;
++  uint32_t marks_unchecked = 0;
++  uint64_t marks_deltas = 0, marks_chunks = 0, marks_checks = 0, marks_missed = 0;
+ };
+ DeltaChain g_delta;
++// sasrt-nx (2026-11-10, sasrt_capture_marks): a check found a chunk changed without a mark: whole compares from then on.
++std::atomic<bool> g_capture_marks_failed{false};
++// The chunks run tv1 found written without a tag or a mark (chunks 26, 27: tile predication; 58: the pixel shader).
++constexpr uint64_t kCaptureUntagged = (uint64_t(1) << 26) | (uint64_t(1) << 27) | (uint64_t(1) << 58);
++// A delta chunk's mark bit (d3d_native.h's numbering: the fetch constants 0-11, the tail from 12): delta chunks 18 on.
++constexpr u32 kDeltaMarkFirst = (0x480 / kDeltaUnitBytes);
++static_assert(kDeltaMarkFirst == 18 && kDeltaHeadChunks == kDeltaMarkFirst + 12);
+ 
+ // The render thread's side: the device the chain's draws rebuild.
+ alignas(64) u8 g_delta_device[d3d::kDeviceSnapshotSize];
+@@ -894,12 +926,35 @@
+     c.device.store(device, std::memory_order_relaxed);
+     c.vs = c.ps = 0;
+     capture->snapshot = SnapshotKind::Rebase;
++    if (static const bool marks_on = REXCVAR_GET(sasrt_capture_marks); marks_on) {  // sasrt-nx (2026-11-10)
++      uint64_t unused;
++      c.marks_primed = native::TakeTouches(device_va, &unused);
++    }
+     ++c.rebases;
+     c.bytes += d3d::kDeviceSnapshotSize;
+   } else {
+     const uint64_t vs = c.vs | uint64_t(device->m_Pending[0]);
+     const uint64_t ps = c.ps | uint64_t(device->m_Pending[1]);
+     c.vs = c.ps = 0;
++    // sasrt-nx (2026-11-10, sasrt_capture_marks): the chunks marked or tagged since the chain's last draw.
++    static const bool marks_on = REXCVAR_GET(sasrt_capture_marks);
++    static const uint32_t marks_period = uint32_t(REXCVAR_GET(sasrt_capture_marks_check));
++    uint64_t marked = 0;
++    bool use_marks = false, check_marks = false;
++    if (marks_on) {
++      uint64_t touched = 0;
++      const bool slot = native::TakeTouches(device_va, &touched);
++      if (slot && c.marks_primed && !g_capture_marks_failed.load(std::memory_order_relaxed)) {
++        marked = touched | kCaptureUntagged |
++                 native::TagChunks(u64(device->m_Pending[2]), u64(device->m_Pending[3]), u64(device->m_Pending[4]));
++        use_marks = true;
++        if (marks_period && ++c.marks_unchecked >= marks_period) {
++          c.marks_unchecked = 0;
++          check_marks = true;
++        }
++      }
++      c.marks_primed = slot;
++    }
+     for (auto &mask : device->m_Pending)
+       mask = 0;
+     std::vector<u8> &out = capture->state;
+@@ -928,7 +983,24 @@
+       ++chunks;
+     };
+     const bool narrow = DeltasNarrowOn();
+-    if (DeltaMasksOn()) {
++    if (use_marks && !check_marks) {
++      // sasrt-nx (2026-11-10, sasrt_capture_marks): the marked chunks only, in the list's (ascending) order; a chunk
++      // before the fetch constants has no mark and is compared (the narrow list has none).
++      const DeltaChunkList &list = narrow ? kDeltaReadChunks : kDeltaAllChunks;
++      const bool neon = NeonCompareOn();
++      for (u32 k = 0; k < list.count; ++k) {
++        const u32 i = list.index[k];
++        if (i >= kDeltaMarkFirst && !((marked >> (i - kDeltaMarkFirst)) & 1))
++          continue;
++        ++c.marks_chunks;
++        const u32 at = DeltaChunkOffset(i), size = DeltaChunkSize(i);
++        const bool differs = size == kDeltaUnitBytes ? banjo::renut_gpu::Line64Differs(bytes + at, c.shadow + at, neon)
++                                                     : std::memcmp(bytes + at, c.shadow + at, size) != 0;
++        if (differs)
++          take(i);
++      }
++      ++c.marks_deltas;
++    } else if (DeltaMasksOn()) {
+       // bangaio-nx (2026-10-29, banjo_renut_delta_masks): which chunks of each run differ, then those in order.
+       const DeltaRuns &runs = narrow ? kDeltaReadRuns : kDeltaAllRuns;
+       for (u32 r = 0; r < runs.count; ++r) {
+@@ -951,6 +1023,26 @@
+           take(i);
+       }
+     }
++    if (check_marks) {
++      // sasrt-nx (2026-11-10, sasrt_capture_marks): the whole compare above against the marks.
++      ++c.marks_checks;
++      for (u32 w = 0; w < 2; ++w) {
++        for (uint64_t bits = h.chunks[w]; bits; bits &= bits - 1) {
++          const u32 i = w * 64 + u32(std::countr_zero(bits));
++          if (i < kDeltaMarkFirst || ((marked >> (i - kDeltaMarkFirst)) & 1))
++            continue;
++          ++c.marks_missed;
++          static std::atomic<uint64_t> logged{0};
++          const uint64_t bit = uint64_t(1) << (i - kDeltaMarkFirst);
++          if (!(logged.fetch_or(bit, std::memory_order_relaxed) & bit))
++            RGPU_WARN("[renut] sasrt_capture_marks: title device chunk {} (+0x{:X}) changed without a mark", i,
++                      DeltaChunkOffset(i));
++          if (marks_period != 1 && !g_capture_marks_failed.exchange(true, std::memory_order_relaxed))
++            RGPU_ERROR("[renut] sasrt_capture_marks: a chunk changed without a mark; every delta compares every read "
++                       "chunk from now on");
++        }
++      }
++    }
+     for (const auto [dirty, base] : {std::pair{vs, kDeltaVertexF}, std::pair{ps, kDeltaPixelF}}) {
+       ForEachGroupRun(dirty, [&](u32 first, u32 count) {
+         const u32 group_bytes = count * kDeltaUnitBytes;
+--- before/app/src/renut_engine/gpu/d3d/hooks/device.cpp
++++ after/app/src/renut_engine/gpu/d3d/hooks/device.cpp
+@@ -1331,6 +1331,7 @@
+ REX_EXTERN(__imp__sub_82CF81C0);  // D3D::InitializePresentationParameters (CDevice*, D3DPRESENT_PARAMETERS*)
+ REX_EXTERN(__imp__sub_82CF75F0);  // D3D::InitializeApiState (CDevice*)
+ REX_EXTERN(__imp__sub_82CD37D8);  // sasrt-nx: the GPU event / query pools of the hardware path (CDevice*)
++REXCVAR_DECLARE(bool, sasrt_capture_marks);  // sasrt-nx (2026-11-10): backend/queued.cpp
+ REXCVAR_DEFINE_BOOL(sasrt_record_device_slots, false, "SASRT/Recording",
+                     "Item 24 (2026-11-10): the no-hardware devices the game records command buffers on get a mark slot "
+                     "(native::TrackDeviceTouches, as banjo-nx's create path), so a recorded op could compare only the "
+@@ -1427,10 +1428,13 @@
+   // banjo-nx's create path gives them (TrackDeviceTouches); this path never did, so every recorded op compared every
+   // chunk. The marks are D3D's own dirty tags plus the chunks run tv1 found set without one (NewOp).
+   static const bool slots = REXCVAR_GET(sasrt_record_device_slots);
+-  if (slots && !title_device)
++  // sasrt-nx (2026-11-10, sasrt_capture_marks): the title device too, for its draws' deltas (queued.cpp).
++  static const bool capture_marks = REXCVAR_GET(sasrt_capture_marks);
++  const bool slot = title_device ? capture_marks : slots;
++  if (slot)
+     native::TrackDeviceTouches(device_va);
+   RGPU_INFO("Guest D3D device (type {}) created at {:#010x}{}", device_type, device_va,
+-            slots && !title_device ? " (a mark slot: sasrt_record_device_slots)" : "");
++            slot ? " (a mark slot: sasrt_record_device_slots / sasrt_capture_marks)" : "");
+   ctx.r3.u64 = 0;  // S_OK
+ }
+ 
+--- before/tools/win/pgo_cycle.ps1
++++ after/tools/win/pgo_cycle.ps1
+@@ -0,0 +1,45 @@
++# sasrt-nx (2026-11-10, machine-copy idea 28): the PGO session in two commands (docs/pgo-lto.md's three steps), with the
++# two traps of 2026-11-10 built in:
++#   - a profile merged into a pgo/ that already holds one adds the counts twice: the old profile is moved aside first;
++#   - a folder already built with -Pgo use relinks its old objects with a new profile unused (Ninja does not track the
++#     .gcda files): the optimised folder is cleaned before its build.
++# Any change to the copies' list or the post-codegen steps changes generated files, and a function changed since the
++# session keeps no profile: run the cycle again after such a change.
++#
++#   powershell -NoProfile -ExecutionPolicy Bypass -File tools\win\pgo_cycle.ps1 -Step generate
++#       the instrumented NRO in out\nx-pgo-gen (incremental). Copy it to the card and play ONE normal race (the user's
++#       rule: a normal run, not more than 5 minutes); the session writes pgo/sasrt_pgo_<N>.stream next to the NRO.
++#   powershell -NoProfile -ExecutionPolicy Bypass -File tools\win\pgo_cycle.ps1 -Step use -Streams <folder>
++#       <folder> holds that session's stream only (fetched from the card). pgo/ is moved to pgo_<date-time>/, the stream
++#       merged into a new pgo/, out\nx cleaned and built with -Pgo use -Final (about an hour).
++param(
++    [Parameter(Mandatory = $true)][ValidateSet('generate', 'use')][string]$Step,
++    [string]$Streams = ''
++)
++$root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
++. (Join-Path $PSScriptRoot 'env.ps1')  # CMake and Ninja on PATH (the clean step below)
++$build = Join-Path $PSScriptRoot 'build_switch.ps1'
++if ($Step -eq 'generate') {
++    & $build -Pgo generate -Build out\nx-pgo-gen
++    exit $LASTEXITCODE
++}
++if (-not $Streams -or -not (Test-Path $Streams)) {
++    Write-Error 'pgo_cycle: -Streams <folder with the session stream> is required for -Step use'
++    exit 1
++}
++$pgo = Join-Path $root 'pgo'
++if ((Test-Path $pgo) -and (Get-ChildItem $pgo -Filter *.gcda -ErrorAction SilentlyContinue)) {
++    $aside = Join-Path $root ('pgo_' + (Get-Date -Format 'yyyyMMdd_HHmm'))
++    Move-Item $pgo $aside
++    Write-Output "pgo_cycle: the previous profile moved to $aside"
++}
++New-Item -ItemType Directory -Force $pgo | Out-Null
++& python (Join-Path $root 'tools\pgo_merge.py') $Streams
++if ($LASTEXITCODE) { exit $LASTEXITCODE }
++$folder = Join-Path $root 'out\nx'
++if (Test-Path (Join-Path $folder 'build.ninja')) {
++    & cmake --build $folder --target clean
++    if ($LASTEXITCODE) { exit $LASTEXITCODE }
++}
++& $build -Pgo use -Final -Build out\nx
++exit $LASTEXITCODE
+
+===== localize_native.py: the atomics patch (applied earlier today, before the batch backup) =====
+--- before-atomics/tools/localize_native.py
++++ after-atomics/tools/localize_native.py
+@@ -75,7 +75,7 @@
+ SLOT_BASE = 8
+ HAND = os.path.join(APP, 'src', 'cpu', 'hot', 'hand.txt')
+ IMAGE_BASE = 0x82000000
+-INDEX_FORMAT = 8  # raise when summarise() changes: the cached index is rebuilt (5: carded vector stores; 6, 7: inline leaves; 8: r1 mirror, 2026-10-23)
++INDEX_FORMAT = 9  # raise when summarise() changes: the cached index is rebuilt (5: carded vector stores; 6, 7: inline leaves; 8: r1 mirror, 2026-10-23; 9: atomics, sasrt-nx 2026-11-10)
+ 
+ REG = re.compile(r'\bctx\.(r\d+|f\d+|v\d+|cr\d|ctr|xer|reserved)\b')
+ DEF = re.compile(r'^DEFINE_REX_FUNC\((\w+)\) \{$')
+@@ -104,6 +104,32 @@
+ RAW_VECTOR_STORE = re.compile(r'^\t(?:REX_CARD\([^()]*\), )?simde_mm_store_si128\(\(simde__m128i\*\)REX_RAW_ADDR\(')
+ RAW_MEMSET = re.compile(r'^\tmemset\(\(void\*\)REX_RAW_ADDR\((.*)\), (\w+), (\d+)\);$')
+ RAW_LOAD = re.compile(r'^\tsimde_mm_store_si128\(\(simde__m128i\*\)\w+(?:\.\w+)+, .*REX_RAW_ADDR\(')
++# sasrt-nx (2026-11-10, the user: "convert as much as you can the profiler picked up on to machine copies"): guest
++# atomics in copies. The game's lwarx / stwcx. pairs (a reservation load into the function's local `reserved`, then a
++# compare-and-swap on the same guest word), its sync / lwsync fences and log2f kept 3,741 of the race's 7,367 samples
++# of generated code out of the copies (SASRT's handheld races lat10-lat14). A copy runs the very statements of the
++# function, the registers in locals, so the running form (Fast) does the same atomic operations on the same guest
++# words. The guard's forms (Logged and o_, the write log and the roll-back) cannot repeat an atomic operation (other
++# threads may see it): each reservation load, compare-and-swap and fence is preceded by `if (s.Open()) return;`, so a
++# logged run ends before the first one (the call is then not compared, as for a call outside the copy), and in the
++# running form Open() is a constant false. log2f is a pure function. SASRT_LOCALIZE_ATOMICS=0: refused, as before.
++ATOMICS = os.environ.get('SASRT_LOCALIZE_ATOMICS', '1') != '0'
++ATOMIC_SPECIAL = {'reserved', 'REX_GUEST_CAS', 'std::atomic_thread_fence', 'log2f'}
++ATOMIC_HOST = {'std::atomic_thread_fence', 'log2f'}
++ATOMIC_LOAD = re.compile(r'^\t+reserved\.u(?:32|64) = \*\(uint(?:32|64)_t\*\)REX_RAW_ADDR\(ea\);$')
++ATOMIC_CAS = re.compile(r'^\t+[\w.]+\.eq = REX_GUEST_CAS(?:_C)?\((?:ea, )?reinterpret_cast<uint(?:32|64)_t\*>\(REX_RAW_ADDR\(ea\)\), '
++                        r'reserved\.s(?:32|64), __builtin_bswap(?:32|64)\([\w.]+\.s(?:32|64)\)\);$')
++ATOMIC_FENCE = re.compile(r'^\t+std::atomic_thread_fence\(std::memory_order_\w+\);$')
++
++
++def atomic_stop(l):
++    """A reservation load, compare-and-swap or fence, with the guard's stop in front (see ATOMICS)."""
++    if not ATOMICS or not (ATOMIC_LOAD.match(l) or ATOMIC_CAS.match(l) or ATOMIC_FENCE.match(l)):
++        return l
++    stripped = l.lstrip('\t')
++    return l[:len(l) - len(stripped)] + '{ if (s.Open()) return; ' + stripped + ' }'
++
++
+ ALL = None  # "reach unknown": every register
+ 
+ 
+@@ -230,14 +256,17 @@
+     if traps:
+         # The trap helper (the generated pch) reads r3 and r4 of the context for its message and writes nothing.
+         regs = sorted(set(regs) | {'r3', 'r4'}, key=order)
+-    special = sorted({m.group(1) for m in SPECIAL.finditer(text)})
++    special = sorted({m.group(1) for m in SPECIAL.finditer(text)} - (ATOMIC_SPECIAL if ATOMICS else set()))
+     for l in lines:
+         for m in NAME.finditer(l):
+             n = m.group(1)
+             if KNOWN.match(n) or l[m.end():].startswith('ctx, base)'):
+                 continue
++            if ATOMICS and n in ATOMIC_HOST:  # sasrt-nx (2026-11-10): see ATOMICS
++                continue
+             special.append('host function ' + n)
+-        if 'REX_RAW_ADDR(' in l and not (RAW_VECTOR_STORE.match(l) or RAW_MEMSET.match(l) or RAW_LOAD.match(l)):
++        if 'REX_RAW_ADDR(' in l and not (RAW_VECTOR_STORE.match(l) or RAW_MEMSET.match(l) or RAW_LOAD.match(l) or
++                                         (ATOMICS and (ATOMIC_LOAD.match(l) or ATOMIC_CAS.match(l)))):
+             special.append('raw guest access')
+     return {'regs': regs, 'written': written_registers(regs, text), 'callees': callees, 'unknown': unknown,
+             'traps': traps, 'special': sorted(set(special)), 'lines': len(lines)}
+@@ -1021,6 +1050,7 @@
+                         pending = True
+                     l = REG.sub(lambda m: 'l_' + m.group(1), l)
+                 l, stores = store_line(l)
++                l = atomic_stop(l)  # sasrt-nx (2026-11-10): see ATOMICS
+                 l = CALL.sub(lambda m: call_text(m, name, regs, here, localized), l)
+                 if localized and sync_out:
+                     # Braces: the generated code also writes a return as the body of a one-line `if`.

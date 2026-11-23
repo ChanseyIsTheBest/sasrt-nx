@@ -1,0 +1,393 @@
+--- a/tools/localize_native.py
++++ b/tools/localize_native.py
+@@ -120,6 +120,90 @@
+     return keep
+ 
+ 
++# sasrt-nx (2026-11-11, machine-copy idea 46, part 2): writable guest globals that stay the same (app/src/cpu/hot/
++# frozen.txt, tools/frozen_pick.py from a sasrt_cpu_frozen_census run) built into the loops of a copy's root function.
++# Only loads inside loops pay (a load outside one costs what the check costs): at the root's start one local says
++# whether every such global still holds its value (`rex_frozen_ok`, compiled to false with REX_FROZEN_ON 0, CMake
++# SASRT_HOT_FROZEN=OFF), and each of those loads becomes `rex_frozen_ok ? value : load`; the compiler's loop
++# unswitching (on with the profile) makes the frozen loop. A global another thread writes during the call is seen as
++# its value at the call's start (the same as the loop running a little earlier). SASRT_LOCALIZE_FROZEN=0: off.
++FROZEN_ON = os.environ.get('SASRT_LOCALIZE_FROZEN', '1') != '0'
++FROZEN_TXT = os.path.join(APP, 'src', 'cpu', 'hot', 'frozen.txt')
++_frozen = None
++FROZEN_STATS = [0, 0]  # load sites, functions
++FZ_SET = re.compile(r'^\t(l{0,2}_?r\d+)\.s64 = (-?\d+);$')
++FZ_ADD = re.compile(r'^\t(l{0,2}_?r\d+)\.s64 = (l{0,2}_?r\d+)\.s64 \+ (-?\d+);$')
++FZ_LOAD = re.compile(r'REX_LOAD_D_(U8|U16|U32|U64)\((l{0,2}_?r\d+)\.u32, (-?\d+)\)')
++FZ_WRITE = re.compile(r'\b(l{0,2}_?r\d+)(?:\.[us]\d+)? = ')
++FZ_SIZE = {'U8': 1, 'U16': 2, 'U32': 4, 'U64': 8}
++FZ_TYPE = {'U8': 'u8', 'U16': 'u16', 'U32': 'u32', 'U64': 'u64'}
++
++
++def frozen_values():
++    global _frozen
++    if _frozen is None:
++        _frozen = {}
++        if FROZEN_ON and os.path.isfile(FROZEN_TXT):
++            for line in open(FROZEN_TXT, encoding='utf-8'):
++                p = line.split('#')[0].split()
++                if len(p) == 3:
++                    _frozen[int(p[0], 16)] = (int(p[1]), int(p[2], 16))
++    return _frozen
++
++
++def freeze_loops(body):
++    """Idea 46 on one root function's running form ((text, block) lines)."""
++    values = frozen_values()
++    if not values or not body:
++        return body
++    texts = [t for t, _ in body]
++    labels = {}
++    for i, t in enumerate(texts):
++        m = re.match(r'^(loc_[0-9A-F]+):', t)
++        if m:
++            labels.setdefault(m.group(1), i)
++    inside = set()
++    for j, t in enumerate(texts):
++        for lab in re.findall(r'goto (loc_[0-9A-F]+);', t):
++            if lab in labels and labels[lab] < j:
++                inside.update(range(labels[lab], j + 1))
++    known, used, out = {}, {}, list(body)
++    for i, t in enumerate(texts):
++        if not t.startswith('\t') or '{' in t or '}' in t or '(ctx, base' in t or 'REX_CALL' in t or t.startswith('\t\t'):
++            known.clear()
++            continue
++        m = FZ_SET.match(t)
++        if m:
++            known[m.group(1)] = int(m.group(2)) & 0xFFFFFFFF
++            continue
++        m = FZ_ADD.match(t)
++        if m and m.group(2) in known:
++            known[m.group(1)] = (known[m.group(2)] + int(m.group(3))) & 0xFFFFFFFF
++            continue
++        if i in inside:
++            def sub(mm):
++                kind, reg, off = mm.group(1), mm.group(2), int(mm.group(3))
++                if reg not in known:
++                    return mm.group(0)
++                a = (known[reg] + off) & 0xFFFFFFFF
++                if a not in values or values[a][0] != FZ_SIZE[kind]:
++                    return mm.group(0)
++                used[a] = kind
++                FROZEN_STATS[0] += 1
++                return '(rex_frozen_ok ? (%s)0x%Xull : %s)' % (FZ_TYPE[kind], values[a][1], mm.group(0))
++            new = FZ_LOAD.sub(sub, t)
++            if new != t:
++                out[i] = (new, body[i][1])
++        for r in FZ_WRITE.findall(t):
++            known.pop(r, None)
++    if not used:
++        return body
++    FROZEN_STATS[1] += 1
++    check = ' && '.join('REX_LOAD_%s(0x%08Xu) == (%s)0x%Xull' % (kind, a, FZ_TYPE[kind], values[a][1])
++                        for a, kind in sorted(used.items()))
++    return [('\tconst bool rex_frozen_ok = REX_FROZEN_ON && (%s);' % check, body[0][1])] + out
++
++
+ BULK_SLOT = 9999  # past PPCContext::host_counters: the guard's countdown is the hook's own (banjo_hot_guest.h)
+ # sasrt-nx (2026-11-08): the first slots belong to the hooks of app/src/hot/sasrt_hot_guest.cpp (the CRT and Direct3D
+ # natives, slots given at their first call, at most sasrt::hot::kCtxSlots = 8); the localized list's hooks follow.
+@@ -1249,6 +1333,8 @@
+                         body.append((f'\tREX_PREFETCH_GUEST({mc.group(1)}.u32);', block))  # idea 52
+                         LOOP_STATS[0] += 1
+             if localized:
++                if name == root:
++                    body = freeze_loops(body)  # machine-copy idea 46, part 2
+                 how = ('[[gnu::always_inline]] static inline' if name in forced
+                        else '[[gnu::noinline, gnu::cold]] static' if name in hand else 'static')
+                 head = (f'template <class S>\n{how} '
+@@ -1516,6 +1602,7 @@
+         print(f'localize_native: {LOOP_STATS[0]} pointer-chase prefetches (idea 52), {LOOP_STATS[1]} counted loops\' '
+               f'barriers left out (idea 60)')
+         print(f'localize_native: {CONST_ARG_FORCED[0]} members with a constant argument forced inline (idea 34)')
++        print(f'localize_native: {FROZEN_STATS[0]} loads of frozen globals in {FROZEN_STATS[1]} copies, in their loops (idea 46)')
+         # Batch 2's audit, finding 2: the shards turn the card runs on only for copies written with them.
+         opt = os.path.join(OUT, 'banjo_hot_options.h')
+         text = ('// GENERATED by tools/localize_native.py: how the copies were written (app/src/cpu/banjo_hot_prelude.h).\n'
+--- a/tools/store_cards.py
++++ b/tools/store_cards.py
+@@ -98,18 +98,49 @@
+ 
+ def stack_ea(lines, k):
+     """Whether the ea a store on lines[k] uses was computed from r1 by its own instruction (the lines since the
+-    instruction's comment). Not found: not known to be the stack."""
++    instruction's comment), or from one register an earlier line of the same straight line set to r1 plus a constant
++    (sasrt-nx 2026-11-11, idea 31's research: `r29 = r1 - 64` ... `ea = (r29.u32) & ~0xF`). Not found: not known to be
++    the stack."""
+     j = k
+     while j >= 0:
+         m = EA_SET.match(lines[j])
+         if m:
+-            return bool(R1.search(m.group(1)))
++            return bool(R1.search(m.group(1))) or (STACK_DERIVED and derived_from_r1(lines, j, m.group(1)))
+         if j < k and INSN.match(lines[j]):
+             return False
+         j -= 1
+     return False
+ 
+ 
++# sasrt-nx (2026-11-11, machine-copy idea 31's research): 10 % of the copies' stack stores went through a register set to
++# r1 plus a constant and kept their cards. SASRT_CARDS_STACK_DERIVED=0: as before.
++STACK_DERIVED = os.environ.get('SASRT_CARDS_STACK_DERIVED', '1') != '0'
++REG_USE = re.compile(r'(?<![\w.])((?:ctx\.)?(?:l{1,2}_)?r\d+)\.(?:u32|s32|u64|s64)\b')
++STRAIGHT_END = re.compile(r'^loc_|\(ctx, base|REX_CALL|[{}]')
++R1_PLUS = re.compile(r'\s*(?:ctx\.)?(?:l{1,2}_)?r1\.(?:s64|u64|u32|s32) \+ -?\d+\s*')
++
++
++def derived_from_r1(lines, j, expr):
++    """Whether expr's one register (not r1 itself) was last set, on the same straight line before lines[j], to r1 plus
++    a constant."""
++    regs = set(REG_USE.findall(expr))
++    if len(regs) != 1:
++        return False
++    reg = regs.pop()
++    define = re.compile(r'^\t+' + re.escape(reg) + r'\.(?:u32|s32|u64|s64) = (.*);$')
++    other_write = re.compile(r'(?<![\w.])' + re.escape(reg) + r'(?:\.\w+)?\s*=[^=]')
++    for q in range(j - 1, max(-1, j - 400), -1):
++        line = lines[q]
++        if STRAIGHT_END.search(line):
++            return False
++        d = define.match(line)
++        if d:
++            return R1_PLUS.fullmatch(d.group(1)) is not None
++        if other_write.search(line):
++            return False  # written some other way: not known
++    return False
++
++
+ def stack_arg(arg, lines, k):
+     arg = arg.strip()
+     if arg == 'ea' or arg.startswith('ea ') or arg.startswith('(ea'):
+--- a/tools/vmx_float_macros.py
++++ b/tools/vmx_float_macros.py
+@@ -0,0 +1,174 @@
++#!/usr/bin/env python3
++"""sasrt-nx (2026-11-11, machine-copy idea 43, F1 and F2): three VMX float operations as macros whose default is the
++expression the generator writes today, so a build can switch each to a faster AArch64 form that is NOT bit-identical
++(post-codegen step, before tools/localize_native.py).
++
++  vrsqrtefp  simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(X))  -> REX_VRSQRTEFP(X)
++  vrefp      simde_mm_div_ps(simde_mm_set1_ps(1), X)                     -> REX_VREFP(X)
++  vmaddfp    simde_mm_add_ps(simde_mm_mul_ps(A, B), C)                   -> REX_VMADDFP(A, B, C)
++
++The port computes the estimates exactly (`fsqrt` + `fdiv`, neither pipelined on the Cortex-A57; 32 of WaterThread's
++207 samples in sub_8286C230) and the multiply-add with two roundings (`fmul` + `fadd`; -ffp-contract=off). The 360's
++vrsqrtefp / vrefp are estimates themselves and its vmaddfp rounds once, so the faster forms are not further from the
++console than today's, but they are not today's results:
++  - REX_VMX_FAST_ESTIMATES (CMake SASRT_VMX_FAST_ESTIMATES, off): `frsqrte` / `frecpe` and two Newton steps
++    (`frsqrts` / `frecps`);
++  - REX_VMX_FUSED_MADD (CMake SASRT_VMX_FUSED_MADD, off): one `fmla`.
++Without them the macros are the expressions above (the same code as before). sasrt_test_vmx_fuzz (the app) compares
++each fast form with the exact one on the console itself (x86 cannot reproduce NEON's estimates).
++
++  python tools/vmx_float_macros.py --gen app/generated/default [--check] [--restore]
++Idempotent (the rewritten text no longer matches); --restore writes the expressions back.
++"""
++import argparse
++import glob
++import os
++import re
++import sys
++
++MARKER = '// rexglue ports: VMX float estimates and multiply-add as macros (tools/vmx_float_macros.py)'
++END = '// (end of tools/vmx_float_macros.py)\n'
++MACROS = MARKER + '''
++#ifndef REX_VRSQRTEFP
++#if (defined(__aarch64__) || defined(_M_ARM64))
++#include <arm_neon.h>
++[[gnu::always_inline]] static inline simde__m128 rex_vrsqrtefp_fast_(simde__m128 x) {
++  const float32x4_t v = simde__m128_to_neon_f32(x);
++  float32x4_t e = vrsqrteq_f32(v);
++  e = vmulq_f32(e, vrsqrtsq_f32(vmulq_f32(v, e), e));
++  e = vmulq_f32(e, vrsqrtsq_f32(vmulq_f32(v, e), e));
++  return simde__m128_from_neon_f32(e);
++}
++[[gnu::always_inline]] static inline simde__m128 rex_vrefp_fast_(simde__m128 x) {
++  const float32x4_t v = simde__m128_to_neon_f32(x);
++  float32x4_t e = vrecpeq_f32(v);
++  e = vmulq_f32(e, vrecpsq_f32(v, e));
++  e = vmulq_f32(e, vrecpsq_f32(v, e));
++  return simde__m128_from_neon_f32(e);
++}
++[[gnu::always_inline]] static inline simde__m128 rex_vmaddfp_fused_(simde__m128 a, simde__m128 b, simde__m128 c) {
++  return simde__m128_from_neon_f32(
++      vfmaq_f32(simde__m128_to_neon_f32(c), simde__m128_to_neon_f32(a), simde__m128_to_neon_f32(b)));
++}
++#endif
++#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(REX_VMX_FAST_ESTIMATES)
++#define REX_VRSQRTEFP(x) rex_vrsqrtefp_fast_(x)
++#define REX_VREFP(x) rex_vrefp_fast_(x)
++#else
++#define REX_VRSQRTEFP(x) simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(x))
++#define REX_VREFP(x) simde_mm_div_ps(simde_mm_set1_ps(1), x)
++#endif
++#if (defined(__aarch64__) || defined(_M_ARM64)) && defined(REX_VMX_FUSED_MADD)
++#define REX_VMADDFP(a, b, c) rex_vmaddfp_fused_(a, b, c)
++#else
++#define REX_VMADDFP(a, b, c) simde_mm_add_ps(simde_mm_mul_ps(a, b), c)
++#endif
++#endif
++''' + END
++ANCHOR = '#define REX_LOAD_U8(x)'
++
++
++def args_of(text, i):
++    """The comma-separated top-level arguments of the call whose '(' is text[i]; (list, index after ')')."""
++    depth, start, out = 0, i + 1, []
++    for k in range(i, len(text)):
++        ch = text[k]
++        if ch == '(':
++            depth += 1
++        elif ch == ')':
++            depth -= 1
++            if depth == 0:
++                out.append(text[start:k].strip())
++                return out, k + 1
++        elif ch == ',' and depth == 1:
++            out.append(text[start:k].strip())
++            start = k + 1
++        elif ch in ';\n':
++            return None, i
++    return None, i
++
++
++def rewrite(line, counts):
++    # vrsqrtefp first (its inner form is also a vrefp's).
++    for name, head, build in (
++            ('rsqrte', 'simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(', None),
++            ('re', 'simde_mm_div_ps(simde_mm_set1_ps(1), ', None),
++            ('madd', 'simde_mm_add_ps(simde_mm_mul_ps(', None)):
++        pos = 0
++        while True:
++            i = line.find(head, pos)
++            if i < 0:
++                break
++            if name == 'rsqrte':
++                inner, end = args_of(line, i + len(head) - 1)  # the sqrt's argument
++                outer_ok = inner is not None and len(inner) == 1 and line[end:end + 1] == ')'
++                if outer_ok:
++                    line = line[:i] + 'REX_VRSQRTEFP(' + inner[0] + ')' + line[end + 1:]
++                    counts[name] += 1
++                    pos = i + 1
++                    continue
++            elif name == 're':
++                a, end = args_of(line, i + len('simde_mm_div_ps'))
++                if a is not None and len(a) == 2 and a[0] == 'simde_mm_set1_ps(1)':
++                    line = line[:i] + 'REX_VREFP(' + a[1] + ')' + line[end:]
++                    counts[name] += 1
++                    pos = i + 1
++                    continue
++            else:
++                a, end = args_of(line, i + len('simde_mm_add_ps'))
++                if a is not None and len(a) == 2 and a[0].startswith('simde_mm_mul_ps('):
++                    m, mend = args_of(a[0], len('simde_mm_mul_ps'))
++                    if m is not None and len(m) == 2 and mend == len(a[0]):
++                        line = line[:i] + 'REX_VMADDFP(%s, %s, %s)' % (m[0], m[1], a[1]) + line[end:]
++                        counts[name] += 1
++                        pos = i + 1
++                        continue
++            pos = i + 1
++    return line
++
++
++RESTORE = [
++    (re.compile(r'REX_VRSQRTEFP\('), 'simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps('),
++]
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument('--gen', required=True)
++    ap.add_argument('--check', action='store_true')
++    ap.add_argument('--restore', action='store_true')
++    a = ap.parse_args()
++    pchs = glob.glob(os.path.join(a.gen, '*_pch.h'))
++    if len(pchs) != 1:
++        sys.exit('ERROR (post-codegen patch): vmx_float_macros: no single *_pch.h in %s' % a.gen)
++    if a.restore:
++        sys.exit('vmx_float_macros: --restore is a codegen away (tools/codegen.ps1): the macros\' defaults are the '
++                 'expressions themselves, so nothing needs restoring for a plain build')
++    counts = {'rsqrte': 0, 're': 0, 'madd': 0}
++    changed = 0
++    for path in sorted(glob.glob(os.path.join(a.gen, '*_recomp.*.cpp'))):
++        text = open(path, encoding='utf-8').read()
++        if 'simde_mm_set1_ps(1)' not in text and 'simde_mm_add_ps(simde_mm_mul_ps(' not in text:
++            continue
++        new = '\n'.join(rewrite(l, counts) if ('simde_mm_div_ps(' in l or 'simde_mm_add_ps(' in l) else l
++                        for l in text.split('\n'))
++        if new != text:
++            changed += 1
++            if not a.check:
++                open(path, 'w', encoding='utf-8', newline='\n').write(new)
++    pch = pchs[0]
++    text = open(pch, encoding='utf-8').read()
++    if MARKER in text:
++        start = text.index(MARKER)
++        text = text[:start] + text[text.index(END, start) + len(END):]
++    if ANCHOR not in text:
++        sys.exit('ERROR (post-codegen patch): vmx_float_macros: no %s in %s' % (ANCHOR, pch))
++    text = text.replace(ANCHOR, MACROS + ANCHOR, 1)
++    if not a.check and text != open(pch, encoding='utf-8').read():
++        open(pch, 'w', encoding='utf-8', newline='\n').write(text)
++    print('vmx_float_macros: %d vrsqrtefp, %d vrefp, %d vmaddfp as macros in %d files%s' % (
++        counts['rsqrte'], counts['re'], counts['madd'], changed, ' (check only)' if a.check else ''))
++
++
++if __name__ == '__main__':
++    main()
+--- a/tools/frozen_pick.py
++++ b/tools/frozen_pick.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""sasrt-nx (2026-11-11, machine-copy idea 46, part 2): the stable globals of a census log (sasrt_cpu_frozen_census,
++app/src/cpu/banjo_hot_guest.cpp) into app/src/cpu/hot/frozen.txt, which tools/localize_native.py reads (FROZEN).
++
++A global is taken when it never changed during the census, or last changed before --settled seconds (the loading
++before the race: the census starts with the first hook). Each line: `<address> <size> <value>` in hex, with a comment
++saying where the value came from. Only integer sizes (1, 2, 4, 8 bytes).
++
++  python tools/frozen_pick.py --log out/console_runs/b2census/sasrt_NNN.log [--settled 100]
++"""
++import argparse
++import os
++import re
++import sys
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++OUT = os.path.join(ROOT, 'app', 'src', 'cpu', 'hot', 'frozen.txt')
++LINE = re.compile(r'\[frozen\] (0x[0-9a-f]+) size (\d+) value (0x[0-9a-f]+) \(first (0x[0-9a-f]+)\): (\d+) changes, '
++                  r'the last at ([0-9.]+) s')
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument('--log', required=True)
++    ap.add_argument('--settled', type=float, default=100.0)
++    a = ap.parse_args()
++    rows = []
++    for line in open(a.log, encoding='utf-8', errors='replace'):
++        m = LINE.search(line)
++        if not m:
++            continue
++        addr, size, value = int(m.group(1), 16), int(m.group(2)), int(m.group(3), 16)
++        changes, last = int(m.group(5)), float(m.group(6))
++        if size in (1, 2, 4, 8) and (changes == 0 or last < a.settled):
++            rows.append((addr, size, value))
++    if not rows:
++        sys.exit('frozen_pick: no census lines in %s' % a.log)
++    head = ('# GENERATED by tools/frozen_pick.py (machine-copy idea 46, part 2) from %s: the writable guest globals the\n'
++            '# copies load at a known address that did not change after %.0f s of the census (sasrt_cpu_frozen_census).\n'
++            '# tools/localize_native.py builds their values into the copies\' loops behind an entry check. Edit freely:\n'
++            '# a line is "<address> <size> <value>" (hex); an empty file freezes nothing.\n'
++            % (os.path.relpath(a.log, ROOT).replace(os.sep, '/'), a.settled))
++    with open(OUT, 'w', encoding='utf-8', newline='\n') as f:
++        f.write(head + ''.join('%08X %d %X\n' % r for r in sorted(rows)))
++    print('frozen_pick: %d globals into %s' % (len(rows), OUT))
++
++
++if __name__ == '__main__':
++    main()

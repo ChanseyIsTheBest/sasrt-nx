@@ -1,0 +1,772 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ *
+ * @modified    Tom Clay & Rien Gupta, 2026 - Adapted for ReXGlue runtime (POSIX + macOS)
+ */
+
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <iostream>
+#include <algorithm>
+#include <cerrno>  // port 203
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>  // port 203
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
+#include <rex/assert.h>
+#include <rex/cvar.h>
+#include <rex/filesystem.h>
+#include <rex/logging.h>
+#include <rex/platform/env.h>
+#include <rex/string.h>
+
+#if defined(__SWITCH__)
+#include "guest_memory_switch.h"  // port 146: RexGmBase / RexGmSize, the guest window
+#endif
+
+// renut-ultimate (2026-11-16, port 146; tw2de_nx's of 2026-10-26/27, the speed-up ON by default at the user's word): the Switch's
+// reads and writes through a host buffer (PosixFileHandle below). ON at the user's word ("port the speed ups as on by default").
+REXCVAR_DEFINE_INT32(filesystem_bounce_piece_mb, 4, "Filesystem",
+                     "tw2de_nx: the Switch's file reads and writes go through a host buffer in pieces of this many MB "
+                     "(1-16; 4 by default, 1 as before). Each piece is a request to the file system service (about 2.3 ms of fixed "
+                     "cost on the console, tw2de_nx): 1 MB pieces cut a large read's speed by about a seventh, 4 MB "
+                     "(masseffect_io_chunk_mb's size, which the reads are split into anyway) by none. Each reading thread "
+                     "keeps a buffer of this size")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// renut-ultimate (2026-11-20, port 203; sims3-nx's): the Switch's one Horizon file per path (OpenExisting below).
+REXCVAR_DEFINE_BOOL(filesystem_shared_handles, true, "Filesystem",
+                    "Switch: every guest handle on a file outside the game's own (saves, profiles) shares one Horizon "
+                    "descriptor, reopened read-write for the first writer: Horizon refuses a write open while another "
+                    "open exists (The Sims 3's saves failed). false = a descriptor per handle, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(filesystem_bounce_guest_only, true, "Filesystem",
+                    "tw2de_nx: only a buffer in the guest's memory goes through the host buffer (the file system refuses "
+                    "guest memory as a transfer buffer); a host buffer (the read cache's, the renderer's) is read and "
+                    "written directly, one copy less. false = every buffer through it, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+#include <dirent.h>
+#include <ftw.h>
+#include <libgen.h>
+#include <pwd.h>
+
+// macOS off_t is 64-bit with no *64 large-file variants; Linux keeps the
+// explicit *64 forms for legacy 32-bit off_t distributions.
+#if defined(__APPLE__) || defined(__SWITCH__)
+using rex_off64_t = off_t;
+#define rex_fseeko64 fseeko
+#define rex_ftello64 ftello
+#define rex_ftruncate64 ftruncate
+#else
+using rex_off64_t = off64_t;
+#define rex_fseeko64 fseeko64
+#define rex_ftello64 ftello64
+#define rex_ftruncate64 ftruncate64
+#endif
+
+namespace rex {
+
+std::string path_to_utf8(const std::filesystem::path& path) {
+  return path.string();
+}
+
+std::u16string path_to_utf16(const std::filesystem::path& path) {
+  return rex::string::to_utf16(path.string());
+}
+
+std::filesystem::path to_path(const std::string_view source) {
+  return source;
+}
+
+std::filesystem::path to_path(const std::u16string_view source) {
+  return rex::string::to_utf8(source);
+}
+
+namespace filesystem {
+
+#if defined(__SWITCH__)
+// libnx stores the arguments hbloader passes here. They are not declared in its
+// headers, but they are libnx.a symbols. C linkage: the namespace does not matter.
+extern "C" int __system_argc;
+extern "C" char** __system_argv;
+#endif
+
+std::filesystem::path GetExecutablePath() {
+#if defined(__APPLE__)
+  // Darwin has no /proc; query the executable path via the dyld API. The first
+  // call reports the required buffer size.
+  uint32_t executable_path_size = 0;
+  _NSGetExecutablePath(nullptr, &executable_path_size);
+  if (!executable_path_size) {
+    return {};
+  }
+
+  std::string executable_path(executable_path_size, '\0');
+  if (_NSGetExecutablePath(executable_path.data(), &executable_path_size) != 0) {
+    return {};
+  }
+
+  if (!executable_path.empty() && executable_path.back() == '\0') {
+    executable_path.pop_back();
+  }
+
+  std::error_code ec;
+  std::filesystem::path canonical_path = std::filesystem::weakly_canonical(executable_path, ec);
+  return ec ? std::filesystem::path(executable_path) : canonical_path;
+#elif defined(__SWITCH__)
+  // Horizon has no /proc. The Linux branch would compile anyway and silently return
+  // empty. hbloader passes the NRO path as argv[0], for example
+  // sdmc:/switch/masseffect-nx/masseffect-nx.nro, and libnx stores it in __system_argv.
+  //
+  // It is returned without the "sdmc:". libstdc++ does not know newlib's devices:
+  // to it, "sdmc:/switch/masseffect-nx" has no root, so it is relative, and
+  // std::filesystem::absolute prepends the current directory. The result is
+  // "sdmc:/switch/masseffect-nx/sdmc:/switch/masseffect-nx/game_root", stat fails with an error
+  // other than "does not exist" and exists() throws filesystem_error. That is how
+  // A first boot died, in Runtime::SetupVfs, with nothing in the log.
+  // "/switch/..." does have a root, and newlib resolves it on the default device,
+  // which is the SD. It is only stripped if that form can be queried.
+  if (__system_argc > 0 && __system_argv && __system_argv[0] && __system_argv[0][0]) {
+    std::string path = __system_argv[0];
+    constexpr std::string_view kSdmc = "sdmc:/";
+    if (std::string_view(path).starts_with(kSdmc)) {
+      std::string rooted = path.substr(kSdmc.size() - 1);
+      struct stat st;
+      if (stat(rooted.c_str(), &st) == 0) {
+        return std::filesystem::path(rooted);
+      }
+    }
+    return std::filesystem::path(path);
+  }
+#if defined(REX_SWITCH_FALLBACK_EXE)
+  // banjo-nx (2026-10-17, ported 2026-10-20): an emulator (Ryujinx) starts NROs without argv, so the app would not
+  // know its folder (no toml, logs or game_root next to it). The app names its usual place on the SD (the root form,
+  // as above), used when it is there. hbloader on a console always passes argv[0].
+  {
+    struct stat st;
+    if (stat(REX_SWITCH_FALLBACK_EXE, &st) == 0) {
+      return std::filesystem::path(REX_SWITCH_FALLBACK_EXE);
+    }
+  }
+#endif
+  return {};
+#else
+  char buff[FILENAME_MAX] = "";
+  readlink("/proc/self/exe", buff, FILENAME_MAX);
+  std::string s(buff);
+  return s;
+#endif
+}
+
+std::filesystem::path GetExecutableFolder() {
+  return GetExecutablePath().parent_path();
+}
+
+std::filesystem::path GetUserFolder() {
+#if defined(__SWITCH__)
+  // Horizon has no XDG_DATA_HOME, no HOME and no user database. The branch below
+  // would end up in pw->pw_dir with pw NULL and kill the process at startup:
+  // rex_app.cpp calls it to decide the data folder. On Switch the data goes next
+  // to the NRO, as in the portable PC version.
+  auto exe_dir = GetExecutableFolder();
+  return exe_dir.empty() ? std::filesystem::path("/switch") : exe_dir;
+#else
+  // get preferred data home
+  if (auto xdg = rex::platform::env::get("XDG_DATA_HOME")) {
+    return std::filesystem::path(*xdg);
+  }
+
+  // if XDG_DATA_HOME not set, fallback to HOME directory
+  if (auto home = rex::platform::env::get("HOME")) {
+    return std::filesystem::path(*home) / ".local" / "share";
+  }
+
+  // if HOME not set, fall back to passwd entry
+  struct passwd pw1;
+  struct passwd* pw;
+  char buf[4096];  // could potentionally lower this
+  getpwuid_r(getuid(), &pw1, buf, sizeof(buf), &pw);
+  assert(&pw1 == pw);  // sanity check
+  return std::filesystem::path(pw->pw_dir) / ".local" / "share";
+#endif
+}
+
+/*
+ * sasrt-nx (2026-10-14), from the Switch, where three things differ from every other POSIX host (the Where's My
+ * Water port found them first: C:/devkitPro/wmw_nx/PORTING_WMW.md, sections 10.1 to 10.3):
+ *  - Horizon refuses to open a file that is already open for writing, and devkitPro's stat() opens the file to
+ *    answer. A second guest handle to an open file, or a path query about it, fails there and works anywhere else.
+ *    This game's save does exactly that (open for reading and writing, write 600 KB, open again for its attributes,
+ *    close both; the console ended in std::terminate at the second open's existence check). So the host descriptor
+ *    of a path is shared: a later open of the same path that needs no more rights than the descriptor has reuses
+ *    it (reads and writes go through pread / pwrite with explicit offsets, so handles share no position), and
+ *    GetInfo / IsOpenOnHost answer from it.
+ *  - devkitPro's newlib is not thread-safe across open / close (its descriptor table): ours are serialised.
+ *  - a read at or past the end fails with EIO instead of returning 0: PosixFileHandle::Read reports end-of-file.
+ * sasrt-nx (2026-11-22, base port 203 merge): on the Switch with filesystem_shared_handles (on), the files outside the
+ * read-only roots (saves, profiles) go through port 203's SharedHostFile below instead (one descriptor per path,
+ * reopened read-write for the first writer, a lock per file over each transfer: newlib's pread / pwrite move the
+ * shared position); its opens and closes take OpenMutex too. The game's read-only files, the cvar off and the other
+ * POSIX hosts keep this sharing.
+ */
+namespace {
+
+struct SharedDescriptor;
+
+struct OpenFileEntry {
+  std::weak_ptr<SharedDescriptor> descriptor;
+  const SharedDescriptor* raw = nullptr;
+};
+
+std::recursive_mutex& OpenMutex() {
+  static std::recursive_mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<std::string, OpenFileEntry>& OpenFiles() {
+  static std::unordered_map<std::string, OpenFileEntry> files;
+  return files;
+}
+
+struct SharedDescriptor {
+  int fd = -1;
+  int mode = O_RDONLY;  // O_RDONLY, O_WRONLY or O_RDWR
+  std::string key;
+  ~SharedDescriptor() {
+    std::lock_guard<std::recursive_mutex> lock(OpenMutex());
+    auto& files = OpenFiles();
+    if (auto it = files.find(key); it != files.end() && it->second.raw == this) files.erase(it);
+    if (fd >= 0) close(fd);
+  }
+};
+
+// A descriptor serves a later open that needs no more rights (an open without read or write rights asks O_RDONLY).
+bool ModeCovers(int have, int want) { return have == O_RDWR || have == want; }
+
+std::shared_ptr<SharedDescriptor> FindOpen(const std::string& key) {
+  auto& files = OpenFiles();
+  const auto it = files.find(key);
+  return it == files.end() ? nullptr : it->second.descriptor.lock();
+}
+
+}  // namespace
+
+FILE* OpenFile(const std::filesystem::path& path, const std::string_view mode) {
+  std::lock_guard<std::recursive_mutex> lock(OpenMutex());  // newlib's descriptor table (see above)
+  return fopen(path.c_str(), std::string(mode).c_str());
+}
+
+bool Seek(FILE* file, int64_t offset, int origin) {
+  return rex_fseeko64(file, rex_off64_t(offset), origin) == 0;
+}
+
+int64_t Tell(FILE* file) {
+  return int64_t(rex_ftello64(file));
+}
+
+bool TruncateStdioFile(FILE* file, uint64_t length) {
+  if (fflush(file)) {
+    return false;
+  }
+  int64_t position = Tell(file);
+  if (position < 0) {
+    return false;
+  }
+  if (rex_ftruncate64(fileno(file), rex_off64_t(length))) {
+    return false;
+  }
+  if (uint64_t(position) > length) {
+    if (!Seek(file, 0, SEEK_END)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static int removeCallback(const char* fpath, const struct stat* sb, int typeflag,
+                          struct FTW* ftwbuf) {
+  int rv = remove(fpath);
+  return rv;
+}
+
+static uint64_t convertUnixtimeToWinFiletime(time_t unixtime) {
+  // Linux uses number of seconds since 1/1/1970, and Windows uses
+  // number of nanoseconds since 1/1/1601
+  // so we convert linux time to nanoseconds and then add the number of
+  // nanoseconds from 1601 to 1970
+  // see https://msdn.microsoft.com/en-us/library/ms724228
+  uint64_t filetime = filetime = (unixtime * 10000000) + 116444736000000000;
+  return filetime;
+}
+
+bool CreateEmptyFile(const std::filesystem::path& path) {
+  std::lock_guard<std::recursive_mutex> lock(OpenMutex());  // newlib's descriptor table (see OpenFile)
+  int file = creat(path.c_str(), 0774);
+  if (file >= 0) {
+    close(file);
+    return true;
+  }
+  return false;
+}
+
+#if defined(__SWITCH__)
+/*
+ * renut-ultimate (2026-11-20, port 203): sims3-nx's one Horizon file per path, however many guest handles it has.
+ * On the Xbox 360 a game can hold a file open several times. Horizon refuses a write open while any other open of the
+ * file exists, and any open while a write open exists: The Sims 3 creates its save, keeps two read handles on it and
+ * then opens it for writing, which failed (NO_SUCH_FILE), and the game reported that saving failed. So every handle
+ * on such a path shares one descriptor, reopened read-write when the first writer comes, with a lock per file over
+ * each transfer (newlib's pread and pwrite move the shared position). stat also opens the file on Horizon and fails
+ * while a writer holds it, so GetInfo asks the shared descriptor first. The game's own files (read-only opens under
+ * the game data root, SetReadOnlyGameRoot below) keep a descriptor per handle and no lock: sharing them stopped
+ * sims3-nx's start-up. filesystem_shared_handles (on): false, a descriptor per handle as before.
+ */
+struct SharedHostFile {
+  std::string key;
+  int fd = -1;
+  bool writable = false;
+  uint32_t references = 0;
+  std::mutex mutex;  // taken after g_shared_files_mutex, never before it
+};
+
+static std::mutex g_shared_files_mutex;
+static std::unordered_map<std::string, std::unique_ptr<SharedHostFile>> g_shared_files;
+// The read-only roots (the game data's, the title update's): set at start (SetReadOnlyGameRoot), read after.
+static std::vector<std::string> g_read_only_roots;
+
+void SetReadOnlyGameRoot(const std::filesystem::path& root) {
+  std::string text = root.string();
+  if (!text.empty() && text.back() != '/')
+    text += '/';
+  g_read_only_roots.push_back(text);
+}
+
+static bool UnderReadOnlyRoot(const std::string& key) {
+  for (const std::string& root : g_read_only_roots)
+    if (key.rfind(root, 0) == 0)
+      return true;
+  return false;
+}
+
+static bool MakeSharedFileWritable(SharedHostFile& shared) {
+  std::lock_guard<std::mutex> lock(shared.mutex);
+  if (shared.writable) return true;
+  close(shared.fd);
+  shared.fd = open(shared.key.c_str(), O_RDWR);
+  if (shared.fd == -1) {
+    REXFS_ERROR("Could not reopen '{}' for writing: errno {}", shared.key, errno);
+    shared.fd = open(shared.key.c_str(), O_RDONLY);
+    return false;
+  }
+  shared.writable = true;
+  return true;
+}
+
+static bool StatSharedFile(const std::filesystem::path& path, struct stat* st) {
+  std::lock_guard<std::mutex> registry(g_shared_files_mutex);
+  const auto it = g_shared_files.find(path.string());
+  if (it == g_shared_files.end()) return false;
+  std::lock_guard<std::mutex> lock(it->second->mutex);
+  std::memset(st, 0, sizeof(*st));
+  if (fstat(it->second->fd, st) != 0) return false;
+  st->st_mode = (st->st_mode & ~S_IFMT) | S_IFREG;
+  return true;
+}
+
+bool TruncateOpenFile(const std::filesystem::path& path) {
+  std::lock_guard<std::recursive_mutex> open_lock(OpenMutex());  // sasrt-nx: MakeSharedFileWritable opens and closes
+  std::lock_guard<std::mutex> registry(g_shared_files_mutex);
+  const auto it = g_shared_files.find(path.string());
+  if (it == g_shared_files.end()) return false;
+  SharedHostFile& shared = *it->second;
+  if (!MakeSharedFileWritable(shared)) return false;
+  std::lock_guard<std::mutex> lock(shared.mutex);
+  return ftruncate(shared.fd, 0) == 0;
+}
+#else
+void SetReadOnlyGameRoot(const std::filesystem::path&) {}
+#endif
+
+bool IsOpenOnHost(const std::filesystem::path& path) {
+#if defined(__SWITCH__)
+  {
+    std::lock_guard<std::mutex> registry(g_shared_files_mutex);  // port 203's shared Horizon files
+    if (g_shared_files.find(path.string()) != g_shared_files.end()) return true;
+  }
+#endif
+  std::lock_guard<std::recursive_mutex> lock(OpenMutex());
+  return FindOpen(path.string()) != nullptr;
+}
+
+class PosixFileHandle : public FileHandle {
+ public:
+  PosixFileHandle(std::filesystem::path path, std::shared_ptr<SharedDescriptor> descriptor)
+      : FileHandle(std::move(path)), descriptor_(std::move(descriptor)), handle_(descriptor_->fd) {}
+#if defined(__SWITCH__)
+  // Port 203: a handle on a shared Horizon file (its descriptor, and its lock over each transfer).
+  PosixFileHandle(std::filesystem::path path, SharedHostFile* shared)
+      : FileHandle(std::move(path)), shared_(shared), handle_(-1) {}  // the members' order
+#endif
+  ~PosixFileHandle() override {
+#if defined(__SWITCH__)
+    if (shared_) {
+      std::lock_guard<std::recursive_mutex> open_lock(OpenMutex());  // sasrt-nx: newlib's descriptor table
+      std::lock_guard<std::mutex> registry(g_shared_files_mutex);
+      if (--shared_->references == 0) {
+        close(shared_->fd);
+        g_shared_files.erase(shared_->key);
+      }
+      return;
+    }
+#endif
+    handle_ = -1;
+    descriptor_.reset();  // the descriptor is closed with its last handle (SharedDescriptor)
+  }
+#if defined(__SWITCH__)
+  /*
+   * sasrt-nx (2026-11-10, peggle1-nx's fix of 2026-10-21, the user: "do we have the fix from peggle one reading files
+   * through a buffer? as that caused fatal system crashes"): on Horizon the file system never sees the caller's buffer.
+   * The buffers here are usually guest memory, committed page by page on first touch (core/guest_memory_switch.h),
+   * which the file system can refuse as an IPC transfer buffer (0xD401); Peggle's first 23 MB read of its DLC straight
+   * into a fresh guest allocation froze the whole console with no log or crash report. So every read and write goes
+   * through a host buffer in 1 MB pieces: one memcpy more, the same results as one pread / pwrite (a short piece ends
+   * the transfer with what was moved, an error before the first byte is an error; the end-of-file rule below kept).
+   */
+  // Port 146: filesystem_bounce_piece_mb (1 MB by default, as before), filesystem_bounce_guest_only (off).
+  static size_t PieceBytes() {
+    static const size_t piece = size_t(std::clamp(REXCVAR_GET(filesystem_bounce_piece_mb), 1, 16)) << 20;
+    return piece;
+  }
+  static uint8_t* Bounce() {
+    static thread_local std::unique_ptr<uint8_t[]> bounce;
+    if (!bounce) bounce = std::make_unique<uint8_t[]>(PieceBytes());
+    return bounce.get();
+  }
+  // One piece into the host buffer; the end-of-file rule of the direct read below (Horizon's EIO at or past the end).
+  // sasrt-nx (2026-11-22, base port 203 merge): through PRead / FStat, so a port 203 shared file reads under its lock.
+  ssize_t ReadPiece(uint8_t* bounce, size_t piece, size_t offset) {
+    ssize_t got = PRead(bounce, piece, off_t(offset));
+    if (got >= 0) return got;
+    struct stat st;
+    if (FStat(&st) && st.st_size >= 0) {
+      const uint64_t size = uint64_t(st.st_size);
+      if (offset >= size) return 0;
+      if (offset + piece > size) return PRead(bounce, size_t(size - offset), off_t(offset));
+    }
+    return -1;
+  }
+  // Whether [p, p + n) is a host buffer the file system may take directly (filesystem_bounce_guest_only).
+  static bool DirectOk(const void* p, size_t n) {
+    static const bool guest_only = REXCVAR_GET(filesystem_bounce_guest_only);
+    if (!guest_only || !n)
+      return false;
+    const uint8_t* base = RexGmBase();
+    const uint8_t* q = static_cast<const uint8_t*>(p);
+    return base && !(q + n > base && q < base + RexGmSize());
+  }
+  bool Read(size_t file_offset, void* buffer, size_t buffer_length,
+            size_t* out_bytes_read) override {
+    if (DirectOk(buffer, buffer_length)) {  // port 146
+      // sasrt-nx (2026-11-19, base port 146 merge): ReadPiece straight into the caller's buffer: the end-of-file rule.
+      const ssize_t got = ReadPiece(static_cast<uint8_t*>(buffer), buffer_length, file_offset);
+      if (got < 0) {
+        *out_bytes_read = 0;
+        return false;
+      }
+      *out_bytes_read = size_t(got);
+      return true;
+    }
+    const size_t kPiece = PieceBytes();
+    uint8_t* const bounce = Bounce();
+    auto* out = static_cast<uint8_t*>(buffer);
+    size_t total = 0;
+    while (total < buffer_length) {
+      const size_t piece = std::min(kPiece, buffer_length - total);
+      const ssize_t got = ReadPiece(bounce, piece, file_offset + total);
+      if (got < 0) {
+        if (!total) {
+          *out_bytes_read = 0;
+          return false;
+        }
+        break;
+      }
+      std::memcpy(out + total, bounce, size_t(got));
+      total += size_t(got);
+      if (size_t(got) < piece) break;
+    }
+    *out_bytes_read = total;
+    return true;
+  }
+  bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
+             size_t* out_bytes_written) override {
+    if (DirectOk(buffer, buffer_length)) {  // port 146
+      const ssize_t put = PWrite(buffer, buffer_length, off_t(file_offset));
+      if (put < 0) {
+        *out_bytes_written = 0;
+        return false;
+      }
+      *out_bytes_written = size_t(put);
+      return true;
+    }
+    const size_t kPiece = PieceBytes();
+    uint8_t* const bounce = Bounce();
+    const auto* in = static_cast<const uint8_t*>(buffer);
+    size_t total = 0;
+    while (total < buffer_length) {
+      const size_t piece = std::min(kPiece, buffer_length - total);
+      std::memcpy(bounce, in + total, piece);
+      const ssize_t put = PWrite(bounce, piece, off_t(file_offset + total));
+      if (put < 0) {
+        if (!total) {
+          *out_bytes_written = 0;
+          return false;
+        }
+        break;
+      }
+      total += size_t(put);
+      if (size_t(put) < piece) break;
+    }
+    *out_bytes_written = total;
+    return true;
+  }
+#else
+  bool Read(size_t file_offset, void* buffer, size_t buffer_length,
+            size_t* out_bytes_read) override {
+    ssize_t out = pread(handle_, buffer, buffer_length, file_offset);
+    if (out < 0) {
+      // Horizon fails a read at or past the end (EIO) where POSIX returns what is there: end-of-file, or the bytes
+      // before it for a read that straddles the end.
+      struct stat st;
+      if (fstat(handle_, &st) == 0 && st.st_size >= 0) {
+        const uint64_t size = uint64_t(st.st_size);
+        if (file_offset >= size) {
+          *out_bytes_read = 0;
+          return true;
+        }
+        if (file_offset + buffer_length > size) {
+          out = pread(handle_, buffer, size_t(size - file_offset), file_offset);
+          if (out >= 0) {
+            *out_bytes_read = static_cast<size_t>(out);
+            return true;
+          }
+        }
+      }
+      *out_bytes_read = 0;
+      return false;
+    }
+    *out_bytes_read = static_cast<size_t>(out);
+    return true;
+  }
+  bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
+             size_t* out_bytes_written) override {
+    ssize_t out = pwrite(handle_, buffer, buffer_length, file_offset);
+    if (out < 0) {
+      *out_bytes_written = 0;
+      return false;
+    }
+    *out_bytes_written = static_cast<size_t>(out);
+    return true;
+  }
+#endif
+#if defined(__SWITCH__)
+  bool SetLength(size_t length) override {
+    if (shared_) {
+      std::lock_guard<std::mutex> lock(shared_->mutex);
+      return ftruncate(shared_->fd, length) >= 0;
+    }
+    return ftruncate(handle_, length) >= 0 ? true : false;
+  }
+  void Flush() override {
+    if (shared_) {
+      std::lock_guard<std::mutex> lock(shared_->mutex);
+      fsync(shared_->fd);
+      return;
+    }
+    fsync(handle_);
+  }
+#else
+  bool SetLength(size_t length) override { return ftruncate(handle_, length) >= 0 ? true : false; }
+  void Flush() override { fsync(handle_); }
+#endif
+
+ private:
+  std::shared_ptr<SharedDescriptor> descriptor_;
+#if defined(__SWITCH__)
+  ssize_t PRead(void* to, size_t n, off_t at) {
+    if (!shared_) return pread(handle_, to, n, at);
+    std::lock_guard<std::mutex> lock(shared_->mutex);
+    return pread(shared_->fd, to, n, at);
+  }
+  ssize_t PWrite(const void* from, size_t n, off_t at) {
+    if (!shared_) return pwrite(handle_, from, n, at);
+    std::lock_guard<std::mutex> lock(shared_->mutex);
+    return pwrite(shared_->fd, from, n, at);
+  }
+  // sasrt-nx: ReadPiece's end-of-file rule asks the size through whichever descriptor the handle reads from.
+  bool FStat(struct stat* st) {
+    if (!shared_) return fstat(handle_, st) == 0;
+    std::lock_guard<std::mutex> lock(shared_->mutex);
+    return fstat(shared_->fd, st) == 0;
+  }
+  SharedHostFile* shared_ = nullptr;
+#endif
+  int handle_ = -1;
+};
+
+std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path& path,
+                                                     uint32_t desired_access,
+                                                     bool /*allow_share_delete*/) {
+  // POSIX allows unlinking/replacing an open file, so there is no share-delete
+  // analog to thread through here.
+  // O_RDONLY/O_WRONLY/O_RDWR are an enumeration in the O_ACCMODE bits, not
+  // independent flags. kGenericExecute grants neither right, matching
+  // GENERIC_EXECUTE on the Windows path.
+  constexpr uint32_t kReadRights =
+      FileAccess::kGenericRead | FileAccess::kGenericAll | FileAccess::kFileReadData;
+  constexpr uint32_t kWriteRights = FileAccess::kGenericWrite | FileAccess::kGenericAll |
+                                    FileAccess::kFileWriteData | FileAccess::kFileAppendData;
+
+  const bool want_read = (desired_access & kReadRights) != 0;
+  const bool want_write = (desired_access & kWriteRights) != 0;
+
+  const std::string key = path.string();
+#if defined(__SWITCH__)
+  static const bool shared_handles = REXCVAR_GET(filesystem_shared_handles);  // port 203
+  const bool game_file = !want_write && UnderReadOnlyRoot(key);
+  if (shared_handles && !game_file) {
+    std::lock_guard<std::recursive_mutex> open_lock(OpenMutex());  // sasrt-nx: newlib's descriptor table
+    std::lock_guard<std::mutex> registry(g_shared_files_mutex);
+    auto found = g_shared_files.find(key);
+    if (found != g_shared_files.end()) {
+      if (want_write && !MakeSharedFileWritable(*found->second)) return nullptr;
+    } else {
+      // A writer always reads as well: a later reader on the same path shares this descriptor.
+      const int fd = open(key.c_str(), want_write ? O_RDWR : O_RDONLY);
+      if (fd == -1) {
+        if (errno != ENOENT) REXFS_ERROR("Could not open '{}' (write {}): errno {}", key, want_write, errno);
+        return nullptr;
+      }
+      auto shared = std::make_unique<SharedHostFile>();
+      shared->key = key;
+      shared->fd = fd;
+      shared->writable = want_write;
+      found = g_shared_files.emplace(key, std::move(shared)).first;
+    }
+    ++found->second->references;
+    return std::make_unique<PosixFileHandle>(path, found->second.get());
+  }
+#endif
+
+  int open_access = O_RDONLY;
+  if (want_read && want_write) {
+    open_access = O_RDWR;
+  } else if (want_write) {
+    open_access = O_WRONLY;
+  }
+
+  // No O_APPEND for kFileAppendData: writes go through pwrite with an explicit
+  // offset, which O_APPEND would override.
+  // sasrt-nx: a path this process holds open with enough rights shares that descriptor (see OpenFile).
+  std::lock_guard<std::recursive_mutex> lock(OpenMutex());
+  if (auto shared = FindOpen(key); shared && ModeCovers(shared->mode, open_access)) {
+    return std::make_unique<PosixFileHandle>(path, std::move(shared));
+  }
+  int handle = open(path.c_str(), open_access);
+  if (handle == -1) {
+    // TODO(benvanik): pick correct response.
+    return nullptr;
+  }
+  auto descriptor = std::make_shared<SharedDescriptor>();
+  descriptor->fd = handle;
+  descriptor->mode = open_access;
+  descriptor->key = key;
+  OpenFiles()[key] = OpenFileEntry{descriptor, descriptor.get()};  // a newer descriptor of the path takes the entry
+  return std::make_unique<PosixFileHandle>(path, std::move(descriptor));
+}
+
+bool GetInfo(const std::filesystem::path& path, FileInfo* out_info) {
+  struct stat st;
+#if defined(__SWITCH__)
+  bool known = StatSharedFile(path, &st) || stat(path.c_str(), &st) == 0;  // port 203
+#else
+  bool known = stat(path.c_str(), &st) == 0;
+#endif
+  if (!known) {
+    // sasrt-nx: Horizon cannot stat a file that is open for writing; one we hold is asked through its descriptor.
+    std::lock_guard<std::recursive_mutex> lock(OpenMutex());
+    if (const auto shared = FindOpen(path.string())) known = fstat(shared->fd, &st) == 0;
+  }
+  if (known) {
+    if (S_ISDIR(st.st_mode)) {
+      out_info->type = FileInfo::Type::kDirectory;
+      out_info->total_size = 0;
+    } else {
+      out_info->type = FileInfo::Type::kFile;
+      out_info->total_size = st.st_size;
+    }
+    out_info->path = path.parent_path();
+    out_info->name = path.filename();
+    out_info->create_timestamp = convertUnixtimeToWinFiletime(st.st_ctime);
+    out_info->access_timestamp = convertUnixtimeToWinFiletime(st.st_atime);
+    out_info->write_timestamp = convertUnixtimeToWinFiletime(st.st_mtime);
+    return true;
+  }
+  return false;
+}
+
+std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
+  std::vector<FileInfo> result;
+
+  DIR* dir = opendir(path.c_str());
+  if (!dir) {
+    return result;
+  }
+
+  while (auto ent = readdir(dir)) {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+      continue;
+    }
+
+    FileInfo info;
+
+    info.name = ent->d_name;
+    struct stat st;
+    stat((path / info.name).c_str(), &st);
+    info.create_timestamp = convertUnixtimeToWinFiletime(st.st_ctime);
+    info.access_timestamp = convertUnixtimeToWinFiletime(st.st_atime);
+    info.write_timestamp = convertUnixtimeToWinFiletime(st.st_mtime);
+    info.path = path;
+    if (ent->d_type == DT_DIR) {
+      info.type = FileInfo::Type::kDirectory;
+      info.total_size = 0;
+    } else {
+      info.type = FileInfo::Type::kFile;
+      info.total_size = st.st_size;
+    }
+    result.push_back(info);
+  }
+  closedir(dir);
+  return result;
+}
+
+}  // namespace filesystem
+}  // namespace rex

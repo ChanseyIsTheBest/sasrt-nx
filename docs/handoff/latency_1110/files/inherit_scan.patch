@@ -1,0 +1,83 @@
+--- a/app/src/renut_engine/gpu/guest/command_buffers.cpp
++++ b/app/src/renut_engine/gpu/guest/command_buffers.cpp
+@@ -75,6 +75,19 @@
+                     "whole device, which suits a game recording on its real device, and drops every draw of one "
+                     "recording on a device of its own (Halo 3's no-hardware device has no targets)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++// sasrt-nx (2026-11-10, the user's thread-latency list, item 12: the recording hook). halo3-nx's NoteSetWords compares 936
++// device words with the device at the buffer's Begin at every op, a word and a branch at a time: 54 % of NewOp's samples
++// and NewOp 43 % of the recording thread's (SASRT's handheld race, run lat3), which the render thread waits on. Its bits
++// are read only by BuildInheritRuns, with banjo_renut_replay_inherits; SASRT has that off, so they were never read.
++REXCVAR_DEFINE_BOOL(sasrt_record_inherit_scan_gate, true, "SASRT/Recording",
++                    "With banjo_renut_replay_inherits off, NewOp leaves out halo3-nx's compare of 936 device words with "
++                    "the device at the buffer's Begin (NoteSetWords) and BeginCommandBuffer its 12.7 KB copy of the "
++                    "device: only the inherits read them. Nothing else changes")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_record_inherit_scan_wide, true, "SASRT/Recording",
++                    "With banjo_renut_replay_inherits on: NoteSetWords compares 16 bytes at a time and sets the four "
++                    "words' bits from the differing halves (the same bits), instead of a word and a branch at a time")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DEFINE_BOOL(banjo_renut_diag_replay_state, false, "Banjo/Diagnostics",
+                     "Diagnostic (halo3-nx): logs the first replayed draws' device words that differ from the running "
+                     "device's, what each recording overrides");
+@@ -1085,10 +1098,40 @@
+         buffer.set_words[at / 128] |= 1u << ((at / 4) & 31);
+     }
+   };
++  // sasrt-nx (2026-11-10, sasrt_record_inherit_scan_wide): 16 bytes a step; a step with no difference costs two 8-byte
++  // XORs and one test. The ranges start and end on 16 bytes, so a step's four words share one set_words word (bit
++  // (at / 4) & 31 is a multiple of 4).
++  const auto scan_wide = [&](u32 from, u32 to) {
++    for (u32 at = from; at < to; at += 16) {
++      uint64_t a[2], b[2];
++      std::memcpy(a, device + at, 16);
++      std::memcpy(b, set.begin_image + at, 16);
++      const uint64_t x0 = a[0] ^ b[0], x1 = a[1] ^ b[1];
++      if (!(x0 | x1)) [[likely]]
++        continue;
++      const u32 bits = u32(u32(x0) != 0) | u32((x0 >> 32) != 0) << 1 | u32(u32(x1) != 0) << 2 | u32((x1 >> 32) != 0) << 3;
++      buffer.set_words[at / 128] |= bits << ((at / 4) & 31);
++    }
++  };
++  static_assert(kFetchBegin % 16 == 0 && kVertexShaderF % 16 == 0 && kInheritTailBegin % 16 == 0 &&
++                d3d::kDeviceSnapshotSize % 16 == 0, "the wide scan's steps");
++  static const bool wide = REXCVAR_GET(sasrt_record_inherit_scan_wide);
++  if (wide) {
++    scan_wide(kFetchBegin, kVertexShaderF);
++    scan_wide(kInheritTailBegin, d3d::kDeviceSnapshotSize);
++    return;
++  }
+   scan(kFetchBegin, kVertexShaderF);
+   scan(kInheritTailBegin, d3d::kDeviceSnapshotSize);
+ }
+ 
++// sasrt-nx (2026-11-10, sasrt_record_inherit_scan_gate): whether NewOp and BeginRecording keep the inherits' words.
++inline bool InheritWordsKept() {
++  static const bool inherits = REXCVAR_GET(banjo_renut_replay_inherits);
++  static const bool gate = REXCVAR_GET(sasrt_record_inherit_scan_gate);
++  return inherits || !gate;
++}
++
+ void BuildInheritRuns(HostCommandBuffer &buffer) {
+   const auto is_set = [&buffer](u32 at) { return (buffer.set_words[at / 128] >> ((at / 4) & 31)) & 1; };
+   const auto mark = [&buffer](u32 at) { buffer.set_words[at / 128] |= 1u << ((at / 4) & 31); };
+@@ -1914,7 +1957,8 @@
+   // The first op of a buffer follows ops of other buffers: nothing known.
+   const bool first = buffer.ops.size() == 1;
+   const auto *bytes = reinterpret_cast<const u8 *>(device);
+-  NoteSetWords(buffer, set, bytes);  // halo3-nx (2026-11-03)
++  if (InheritWordsKept())  // sasrt-nx (2026-11-10, sasrt_record_inherit_scan_gate)
++    NoteSetWords(buffer, set, bytes);  // halo3-nx (2026-11-03)
+   if (kind == OpKind::Draw) {
+     u32 vs_word;
+     std::memcpy(&vs_word, bytes + d3d::kDeviceOffsetVertexShader, 4);
+@@ -2956,7 +3000,8 @@
+   if (const auto *device = GuestPtr<const d3d::Device>(device_va)) {
+     set.vs = u64(device->m_Pending[0]);
+     set.ps = u64(device->m_Pending[1]);
+-    std::memcpy(set.begin_image, device, sizeof(set.begin_image));
++    if (InheritWordsKept())  // sasrt-nx (2026-11-10, sasrt_record_inherit_scan_gate)
++      std::memcpy(set.begin_image, device, sizeof(set.begin_image));
+   }
+ }
+ 

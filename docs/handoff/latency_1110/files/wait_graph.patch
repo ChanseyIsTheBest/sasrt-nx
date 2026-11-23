@@ -1,0 +1,235 @@
+--- a/sdk/src/system/xobject.cpp
++++ b/sdk/src/system/xobject.cpp
+@@ -30,6 +30,127 @@
+ 
+ #include "global_lock_spin.h"
+ 
++#include <algorithm>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++
++REXCVAR_DEFINE_BOOL(rex_wait_graph, false, "Kernel",
++                    "Diagnostic (2026-11-10, sasrt-nx's thread-latency round): every guest wait timed per waiting thread "
++                    "and object, and every signal counted per object and signalling thread; every 10 s a \"[waits]\" "
++                    "line per thread with its largest waits and who signalled them")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++namespace rex::system {
++namespace {
++struct WgStat {
++  uint64_t ns = 0, count = 0;
++  uint32_t type = 0, guest = 0;
++  bool multi = false;
++};
++std::mutex g_wg_mutex;
++std::unordered_map<std::string, std::unordered_map<const XObject*, WgStat>> g_wg_waits;  // thread -> object
++std::unordered_map<const XObject*, std::unordered_map<std::string, uint64_t>> g_wg_signals;  // object -> signaller
++std::chrono::steady_clock::time_point g_wg_since = std::chrono::steady_clock::now();
++
++std::string WgThread() {
++  XThread* t = XThread::GetCurrentThread();
++  return t ? t->short_name() : std::string("host");
++}
++
++const char* WgType(uint32_t type) {
++  switch (XObject::Type(type)) {
++    case XObject::Type::Event: return "event";
++    case XObject::Type::Semaphore: return "semaphore";
++    case XObject::Type::Mutant: return "mutant";
++    case XObject::Type::Thread: return "thread";
++    case XObject::Type::Timer: return "timer";
++    default: return "object";
++  }
++}
++
++void WgReportLocked(double seconds) {
++  struct Row {
++    std::string thread;
++    uint64_t ns = 0, count = 0;
++  };
++  std::vector<Row> rows;
++  for (const auto& [thread, objects] : g_wg_waits) {
++    Row r{thread};
++    for (const auto& [o, s] : objects) {
++      r.ns += s.ns;
++      r.count += s.count;
++    }
++    rows.push_back(r);
++  }
++  // sasrt-nx (2026-11-10, run wg): the threads blocked most were the idle ones (audio, file), so the busy threads
++  // (the game's main thread, its renderer) seldom made the ten lines: a thread blocked for more than 90 % of the
++  // window is left out (it waits for work, not on other threads' work).
++  rows.erase(std::remove_if(rows.begin(), rows.end(),
++                            [seconds](const Row& r) { return double(r.ns) > seconds * 0.9e9; }),
++             rows.end());
++  std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.ns > b.ns; });
++  for (size_t i = 0; i < rows.size() && i < 10; ++i) {
++    const auto& objects = g_wg_waits[rows[i].thread];
++    std::vector<std::pair<const XObject*, WgStat>> top(objects.begin(), objects.end());
++    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
++    std::string line = fmt::format("[waits] {:.1f} s: {}: {:.0f} ms blocked in {} waits", seconds, rows[i].thread,
++                                   double(rows[i].ns) / 1e6, rows[i].count);
++    for (size_t k = 0; k < top.size() && k < 4; ++k) {
++      const WgStat& s = top[k].second;
++      line += fmt::format("; {:.0f} ms ({} waits) on {} {:08X}{}", double(s.ns) / 1e6, s.count, WgType(s.type),
++                          s.guest, s.multi ? " (in a multiple wait)" : "");
++      auto it = g_wg_signals.find(top[k].first);
++      if (it != g_wg_signals.end() && !it->second.empty()) {
++        std::vector<std::pair<std::string, uint64_t>> by(it->second.begin(), it->second.end());
++        std::sort(by.begin(), by.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
++        uint64_t total = 0;
++        for (const auto& b : by) total += b.second;
++        line += " signalled by";
++        for (size_t j = 0; j < by.size() && j < 3; ++j)
++          line += fmt::format("{} {} {:.0f} %", j ? "," : "", by[j].first, 100.0 * double(by[j].second) / double(total));
++      }
++    }
++    REXSYS_INFO("{}", line);
++  }
++  g_wg_waits.clear();
++  g_wg_signals.clear();
++}
++
++void WgNoteWait(const XObject* o, uint64_t ns, bool multi) {
++  const std::string thread = WgThread();
++  std::lock_guard<std::mutex> lock(g_wg_mutex);
++  WgStat& s = g_wg_waits[thread][o];
++  s.ns += ns;
++  ++s.count;
++  s.type = uint32_t(o->type());
++  s.guest = o->guest_object();
++  s.multi = s.multi || multi;
++  const auto now = std::chrono::steady_clock::now();
++  const double seconds = std::chrono::duration<double>(now - g_wg_since).count();
++  if (seconds >= 10.0) {
++    WgReportLocked(seconds);
++    g_wg_since = now;
++  }
++}
++}  // namespace
++
++bool XObject::WaitGraphOn() {
++  static const bool on = REXCVAR_GET(rex_wait_graph);
++  return on;
++}
++
++void XObject::WaitGraphNoteSignal() const {
++  if (!WaitGraphOn()) return;
++  const std::string thread = WgThread();
++  std::lock_guard<std::mutex> lock(g_wg_mutex);
++  ++g_wg_signals[this][thread];
++}
++}  // namespace rex::system
++
+ namespace rex::system {
+ 
+ XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
+@@ -207,7 +328,12 @@
+                                 : std::chrono::milliseconds::max();
+ 
+   XThread::CheckTitleTermination();
++  const bool graph = WaitGraphOn();  // sasrt-nx (2026-11-10, rex_wait_graph)
++  const auto graph_start = graph ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+   auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
++  if (graph) [[unlikely]]
++    WgNoteWait(this, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
++                                                                                    graph_start).count()), false);
+   XThread::CheckTitleTermination();
+   switch (result) {
+     case rex::thread::WaitResult::kSuccess:
+@@ -276,9 +402,16 @@
+                                 : std::chrono::milliseconds::max();
+ 
+   XThread::CheckTitleTermination();
++  const bool graph = WaitGraphOn();  // sasrt-nx (2026-11-10, rex_wait_graph)
++  const auto graph_start = graph ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+   if (wait_type) {
+     auto result =
+         rex::thread::WaitAny(wait_handles, count, alertable ? true : false, timeout_ms);
++    if (graph && count) [[unlikely]]
++      WgNoteWait(result.first == rex::thread::WaitResult::kSuccess && result.second < count ? objects[result.second]
++                                                                                             : objects[0],
++                 uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
++                                                                              graph_start).count()), true);
+     XThread::CheckTitleTermination();
+     switch (result.first) {
+       case rex::thread::WaitResult::kSuccess:
+@@ -300,6 +433,9 @@
+   } else {
+     auto result =
+         rex::thread::WaitAll(wait_handles, count, alertable ? true : false, timeout_ms);
++    if (graph && count) [[unlikely]]
++      WgNoteWait(objects[0], uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                         std::chrono::steady_clock::now() - graph_start).count()), true);
+     XThread::CheckTitleTermination();
+     switch (result) {
+       case rex::thread::WaitResult::kSuccess:
+--- a/sdk/src/system/xevent.cpp
++++ b/sdk/src/system/xevent.cpp
+@@ -76,11 +76,13 @@
+ 
+ int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
+   REX_SYS_CENSUS(rex::syscount::kCensusEventSet, 1);
++  WaitGraphNoteSignal();  // sasrt-nx (2026-11-10, rex_wait_graph)
+   event_->Set();
+   return 1;
+ }
+ 
+ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
++  WaitGraphNoteSignal();  // sasrt-nx (2026-11-10, rex_wait_graph)
+   event_->Pulse();
+   return 1;
+ }
+--- a/sdk/src/system/xsemaphore.cpp
++++ b/sdk/src/system/xsemaphore.cpp
+@@ -41,6 +41,7 @@
+ 
+ bool XSemaphore::ReleaseSemaphore(int32_t release_count, int32_t* out_previous_count) {
+   REX_SYS_CENSUS(rex::syscount::kCensusSemRelease, 1);
++  WaitGraphNoteSignal();  // sasrt-nx (2026-11-10, rex_wait_graph)
+   int32_t previous_count = 0;
+   bool success = semaphore_->Release(release_count, &previous_count);
+   if (out_previous_count) {
+--- a/sdk/src/system/xmutant.cpp
++++ b/sdk/src/system/xmutant.cpp
+@@ -45,6 +45,7 @@
+ 
+   // TODO(benvanik): abandoning.
+   assert_false(abandon);
++  WaitGraphNoteSignal();  // sasrt-nx (2026-11-10, rex_wait_graph)
+   if (mutant_->Release()) {
+     return X_STATUS_SUCCESS;
+   } else {
+--- a/sdk/include/rex/system/xobject.h
++++ b/sdk/include/rex/system/xobject.h
+@@ -220,6 +220,11 @@
+ 
+   // Called on successful wait.
+   virtual void WaitCallback() {}
++
++  // sasrt-nx (2026-11-10, rex_wait_graph, the user's thread-latency list item 13): who waits on which object and for how
++  // long, and who signals it. Off: one load of a static bool each.
++  static bool WaitGraphOn();
++  void WaitGraphNoteSignal() const;
+   virtual rex::thread::WaitHandle* GetWaitHandle() { return nullptr; }
+ 
+   // Creates the kernel object for guest code to use. Typically not needed.
+--- a/sdk/include/rex/system/xthread.h
++++ b/sdk/include/rex/system/xthread.h
+@@ -336,6 +336,12 @@
+   uint32_t last_error();
+   void set_last_error(uint32_t error_code);
+   void set_name(const std::string_view name);
++  // sasrt-nx (2026-11-10, rex_wait_graph): the name without its " (handle)", copied under the lock.
++  std::string short_name() {
++    std::lock_guard<std::mutex> lock(thread_lock_);
++    const size_t paren = thread_name_.rfind(" (");
++    return paren == std::string::npos ? thread_name_ : thread_name_.substr(0, paren);
++  }
+ 
+   X_STATUS Create();
+   X_STATUS Exit(int exit_code);

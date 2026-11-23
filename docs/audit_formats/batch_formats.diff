@@ -1,0 +1,432 @@
+--- app/thirdparty/plume/plume_render_interface_types.h	2026-11-09 06:36:31.819140900 +1000
++++ app/thirdparty/plume/plume_render_interface_types.h	2026-11-11 11:23:40.524003400 +1000
+@@ -169,6 +169,11 @@
+         S8_UINT,
+         // banjo-nx (2026-10-19): 24-bit unorm depth with 8-bit stencil, 4 bytes a pixel (deko3d Z24S8; the Xenos D24S8).
+         D24_UNORM_S8_UINT,
++        // sasrt-nx (2026-11-11, renut_format_10bit_exact): 10:10:10:2 unorm, R in bits 0-9 ... A in 30-31 (the Xenos
++        // 2_10_10_10's own 32-bit layout; deko3d RGB10A2, Vulkan A2B10G10R10_PACK32, D3D12 R10G10B10A2).
++        R10G10B10A2_UNORM,
++        // sasrt-nx (2026-11-11, renut_format_7e3_rg11b10): 11:11:10 unsigned float, no alpha (deko3d RG11B10).
++        R11G11B10_FLOAT,
+         MAX
+     };
+ 
+@@ -574,6 +579,8 @@
+         case RenderFormat::R32_UINT:
+         case RenderFormat::R32_SINT:
+         case RenderFormat::D24_UNORM_S8_UINT:
++        case RenderFormat::R10G10B10A2_UNORM:  // sasrt-nx (2026-11-11)
++        case RenderFormat::R11G11B10_FLOAT:    // sasrt-nx (2026-11-11)
+             return 4;
+         case RenderFormat::R8G8_TYPELESS:
+         case RenderFormat::R8G8_UNORM:
+@@ -657,6 +664,8 @@
+         case RenderFormat::D32_FLOAT:
+         case RenderFormat::D32_FLOAT_S8_UINT:
+         case RenderFormat::D24_UNORM_S8_UINT:
++        case RenderFormat::R10G10B10A2_UNORM:  // sasrt-nx (2026-11-11)
++        case RenderFormat::R11G11B10_FLOAT:    // sasrt-nx (2026-11-11)
+         case RenderFormat::R32_FLOAT:
+         case RenderFormat::R32_UINT:
+         case RenderFormat::R32_SINT:
+--- app/thirdparty/plume/plume_deko3d.cpp	2026-11-09 23:05:53.718020500 +1000
++++ app/thirdparty/plume/plume_deko3d.cpp	2026-11-11 11:23:40.524003400 +1000
+@@ -217,6 +217,8 @@
+         case RenderFormat::D32_FLOAT: return DkImageFormat_ZF32;
+         case RenderFormat::D32_FLOAT_S8_UINT: return DkImageFormat_ZF32_X24S8;
+         case RenderFormat::D24_UNORM_S8_UINT: return DkImageFormat_Z24S8;  // banjo-nx (2026-10-19)
++        case RenderFormat::R10G10B10A2_UNORM: return DkImageFormat_RGB10A2_Unorm;  // sasrt-nx (2026-11-11)
++        case RenderFormat::R11G11B10_FLOAT: return DkImageFormat_RG11B10_Float;    // sasrt-nx (2026-11-11)
+         case RenderFormat::R32_UINT: return DkImageFormat_R32_Uint;
+         case RenderFormat::R32_SINT: return DkImageFormat_R32_Sint;
+         case RenderFormat::R8G8_TYPELESS:
+--- app/thirdparty/plume/plume_vulkan.cpp	2026-11-08 11:11:38.837008800 +1000
++++ app/thirdparty/plume/plume_vulkan.cpp	2026-11-11 11:23:40.526003900 +1000
+@@ -443,6 +443,10 @@
+             return VK_FORMAT_D32_SFLOAT_S8_UINT;
+         case RenderFormat::D24_UNORM_S8_UINT:  // banjo-nx (2026-10-19)
+             return VK_FORMAT_D24_UNORM_S8_UINT;
++        case RenderFormat::R10G10B10A2_UNORM:  // sasrt-nx (2026-11-11)
++            return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
++        case RenderFormat::R11G11B10_FLOAT:  // sasrt-nx (2026-11-11)
++            return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+         case RenderFormat::S8_UINT:
+             return VK_FORMAT_S8_UINT;
+         case RenderFormat::R32_FLOAT:
+--- app/thirdparty/plume/plume_d3d12.cpp	2026-11-08 11:11:38.821009000 +1000
++++ app/thirdparty/plume/plume_d3d12.cpp	2026-11-11 11:23:40.527003400 +1000
+@@ -146,6 +146,10 @@
+             return DXGI_FORMAT_R32G8X24_TYPELESS;
+         case RenderFormat::D24_UNORM_S8_UINT:  // banjo-nx (2026-10-19): typeless, as above
+             return DXGI_FORMAT_R24G8_TYPELESS;
++        case RenderFormat::R10G10B10A2_UNORM:  // sasrt-nx (2026-11-11)
++            return DXGI_FORMAT_R10G10B10A2_UNORM;
++        case RenderFormat::R11G11B10_FLOAT:  // sasrt-nx (2026-11-11)
++            return DXGI_FORMAT_R11G11B10_FLOAT;
+         case RenderFormat::R32_FLOAT:
+             return DXGI_FORMAT_R32_FLOAT;
+         case RenderFormat::R32_UINT:
+--- app/src/renut_engine/gpu/render/format.h	2026-11-08 11:11:28.474576100 +1000
++++ app/src/renut_engine/gpu/render/format.h	2026-11-11 11:23:40.561044100 +1000
+@@ -131,11 +131,21 @@
+   Fmt16_16_16_16 = 5,
+   Fmt16_16_Float = 6,
+   Fmt16_16_16_16_Float = 7,
++  // sasrt-nx (2026-11-11, renut_format_edram_as_variants): the two EDRAM formats that fell to 8-bit RGBA before.
++  Fmt2_10_10_10_As10_10_10_10 = 10,
++  Fmt2_10_10_10_Float_As16_16_16_16 = 12,
+   Fmt32_Float = 14,
+   Fmt32_32_Float = 15,
+ };
+ 
+ plume::RenderFormat ColorTargetFormat(GpuColorFormat format);
++// sasrt-nx (2026-11-11, docs/360-precision-differences.md; format.cpp's keys, renut_format_10bit_exact and the others):
++bool Format10BitExactOn();
++bool Float32PointFilterOn();
++bool DepthFloatNoStencilOn();
++bool DiagFormatsOn();
++bool IsFloat32TextureFormat(GpuTextureFormat format);
++const char *GpuTextureFormatName(u32 format);  // for the logs
+ plume::RenderFormat DepthTargetFormat();
+ // banjo-nx (2026-10-19, banjo_deko3d_depth24): the host format of a depth target of D3D format 'd3d_format': 24-bit
+ // unorm with stencil (4 bytes a pixel, the Xenos D24S8's own) for D24S8 on deko3d, else DepthTargetFormat().
+@@ -153,7 +163,8 @@
+   R5G6B5,        // 16-bit packed formats expanded to RGBA8
+   R5G5B5A1,
+   R4G4B4A4,
+-  R10G10B10A2,   // expanded to RGBA16 UNORM (plume has no 10:10:10:2 format)
++  R10G10B10A2,   // expanded to RGBA16 UNORM (the _AS_16_16_16_16 form, and renut_format_10bit_exact off; on, 2_10_10_10
++                 // is copied as it is into R10G10B10A2_UNORM; audit finding 8)
+   R11G11B10,     // Fmt11_11_10: R 11, G 11, B 10 bits, UNORM, to RGBA16 UNORM
+   R10G11B11,     // Fmt10_11_11: R 10, G 11, B 11 bits, UNORM, to RGBA16 UNORM
+   Depth24,       // Fmt24_8 / Fmt24_8_Float: depth in the high 24 bits, to R32_FLOAT
+--- app/src/renut_engine/gpu/render/format.cpp	2026-11-08 11:25:39.816753300 +1000
++++ app/src/renut_engine/gpu/render/format.cpp	2026-11-11 11:23:40.528005000 +1000
+@@ -13,18 +13,115 @@
+ 
+ REXCVAR_DECLARE(bool, sasrt_renut_fixed16_float);  // sasrt-nx (2026-11-08): renut-ultimate's now (gpu/ultimate.cpp)
+ 
++// sasrt-nx (2026-11-11, the user: "implement everything on the 19 rows", "useful for the ultimate base", "turn it on by
++// default ... as it's more accurate"; docs/360-precision-differences.md): where the renderer kept more than the Xenos
++// did at a speed cost. Universal (any game's targets and textures of these formats).
++REXCVAR_DEFINE_BOOL(renut_format_10bit_exact, true, "Renut/Formats",
++                    "Xenos 2_10_10_10 render targets and textures in the host's 10:10:10:2 format (the console's own 32 "
++                    "bits a pixel, the same values) instead of 16 bits a channel; their resolves follow. Off: 16 bits a "
++                    "channel, as before")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(renut_format_edram_as_variants, true, "Renut/Formats",
++                    "The Xenos target formats 2_10_10_10_AS_10_10_10_10 and 2_10_10_10_FLOAT_AS_16_16_16_16 as 10:10:10:2 "
++                    "(16 bits a channel without renut_format_10bit_exact) and FP16; off: 8-bit RGBA, as before (less "
++                    "than the console keeps)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(renut_format_7e3_rg11b10, false, "Renut/Formats",
++                    "NOT exact: Xenos 7e3 targets (2_10_10_10_FLOAT) as 11:11:10 float, half FP16's bytes. No alpha (the "
++                    "7e3's 2 bits read as 1) and one mantissa bit less on red and green, two on blue; more range. Off: "
++                    "FP16")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(renut_depth_float_no_stencil, false, "Renut/Formats",
++                    "A speed trade: Xenos float depth targets (D24FS8) as 32-bit float depth without a stencil plane "
++                    "(half the bytes of D32F_S8). Stencil on them then does nothing: the first uses are logged "
++                    "(renut_diag_formats). Off: D32F with stencil")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(renut_float32_point_filter, true, "Renut/Formats",
++                    "32-bit float textures point-sampled whatever the sampler asks, as the Xenos (which cannot filter "
++                    "them) samples them; off: filtered linearly when asked")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(renut_diag_formats, true, "Renut/Formats",
++                    "Diagnostic, logging only: the first targets and textures of each format a session makes (guest and "
++                    "host formats), the first stencil use on each depth target, the first float textures asked for "
++                    "linear filtering")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace renut::gpu {
+ 
++bool Format10BitExactOn() {
++  static const bool on = REXCVAR_GET(renut_format_10bit_exact);
++  return on;
++}
++bool Float32PointFilterOn() {
++  static const bool on = REXCVAR_GET(renut_float32_point_filter);
++  return on;
++}
++bool DepthFloatNoStencilOn() {
++  static const bool on = REXCVAR_GET(renut_depth_float_no_stencil);
++  return on;
++}
++bool DiagFormatsOn() {
++  static const bool on = REXCVAR_GET(renut_diag_formats);
++  return on;
++}
++bool IsFloat32TextureFormat(GpuTextureFormat format) {
++  return format == GpuTextureFormat::Fmt32_Float || format == GpuTextureFormat::Fmt32_32_Float ||
++         format == GpuTextureFormat::Fmt32_32_32_32_Float || format == GpuTextureFormat::Fmt32_32_32_Float;
++}
++const char *GpuTextureFormatName(u32 format) {
++  switch (format & 0x3F) {
++  case 2: return "8";
++  case 6: return "8_8_8_8";
++  case 7: return "2_10_10_10";
++  case 10: return "8_8";
++  case 18: return "DXT1";
++  case 19: return "DXT2_3";
++  case 20: return "DXT4_5";
++  case 22: return "24_8 (D24S8)";
++  case 23: return "24_8_FLOAT (D24FS8)";
++  case 25: return "16_16";
++  case 26: return "16_16_16_16";
++  case 31: return "16_16_FLOAT";
++  case 32: return "16_16_16_16_FLOAT";
++  case 36: return "32_FLOAT";
++  case 37: return "32_32_FLOAT";
++  case 38: return "32_32_32_32_FLOAT";
++  case 49: return "DXN";
++  case 54: return "2_10_10_10_AS_16_16_16_16";
++  case 58: return "DXT3A";
++  case 59: return "DXT5A";
++  case 60: return "CTX1";
++  case 57: return "32_32_32_FLOAT";
++  case 62: return "8_8_8_8_GAMMA_EDRAM";
++  case 63: return "2_10_10_10_FLOAT (7e3)";
++  default: return "?";
++  }
++}
++
+ plume::RenderFormat ColorTargetFormat(GpuColorFormat format) {
++  static const bool fp10_packed = REXCVAR_GET(renut_format_7e3_rg11b10);
++  static const bool as_variants = REXCVAR_GET(renut_format_edram_as_variants);
+   switch (format) {
+   case GpuColorFormat::Fmt8_8_8_8:
+   case GpuColorFormat::Fmt8_8_8_8_Gamma:
+     return plume::RenderFormat::R8G8B8A8_UNORM;
++  // sasrt-nx (2026-11-11, renut_format_10bit_exact): the console's own 32 bits; 16 bits a channel before.
+   case GpuColorFormat::Fmt2_10_10_10:
+-    return plume::RenderFormat::R16G16B16A16_UNORM;
++    return Format10BitExactOn() ? plume::RenderFormat::R10G10B10A2_UNORM : plume::RenderFormat::R16G16B16A16_UNORM;
++  // sasrt-nx (2026-11-11, renut_format_7e3_rg11b10, NOT exact, off): 7e3 in 32 bits without alpha.
+   case GpuColorFormat::Fmt2_10_10_10_Float:
++    return fp10_packed ? plume::RenderFormat::R11G11B10_FLOAT : plume::RenderFormat::R16G16B16A16_FLOAT;
+   case GpuColorFormat::Fmt16_16_16_16_Float:
+     return plume::RenderFormat::R16G16B16A16_FLOAT;
++  // sasrt-nx (2026-11-11, renut_format_edram_as_variants): these two fell to the default (8-bit RGBA) before.
++  case GpuColorFormat::Fmt2_10_10_10_As10_10_10_10:
++    if (!as_variants)
++      return plume::RenderFormat::R8G8B8A8_UNORM;
++    return Format10BitExactOn() ? plume::RenderFormat::R10G10B10A2_UNORM : plume::RenderFormat::R16G16B16A16_UNORM;
++  case GpuColorFormat::Fmt2_10_10_10_Float_As16_16_16_16:  // (audit finding 7: as format 3, one storage format)
++    if (!as_variants)
++      return plume::RenderFormat::R8G8B8A8_UNORM;
++    return fp10_packed ? plume::RenderFormat::R11G11B10_FLOAT : plume::RenderFormat::R16G16B16A16_FLOAT;
+   // sasrt-nx (2026-10-20, sasrt_renut_fixed16_float): Xenos' 16-bit fixed-point targets span -32..32; FP16 holds that
+   // range, SNORM clipped it at 1.
+   case GpuColorFormat::Fmt16_16:
+@@ -181,7 +278,12 @@
+     return expand(F::R8G8B8A8_UNORM, C::R5G6B5, 2, 4);
+   case T::Fmt4_4_4_4:
+     return expand(F::R8G8B8A8_UNORM, C::R4G4B4A4, 2, 4);
++  // sasrt-nx (2026-11-11, renut_format_10bit_exact): 2_10_10_10 copied as it is into 10:10:10:2 (X in bits 0-9 is the
++  // host's R, as the expansion below read it); the _AS_16_16_16_16 form (filtered at 16 bits on the console) keeps 16.
+   case T::Fmt2_10_10_10:
++    if (Format10BitExactOn())
++      return plain(F::R10G10B10A2_UNORM, 4);
++    return expand(F::R16G16B16A16_UNORM, C::R10G10B10A2, 4, 8);
+   case T::Fmt2_10_10_10_As16_16_16_16:
+     return expand(F::R16G16B16A16_UNORM, C::R10G10B10A2, 4, 8);
+   case T::Fmt11_11_10:
+--- app/src/renut_engine/gpu/render/surfaces.cpp	2026-11-09 23:56:27.470271000 +1000
++++ app/src/renut_engine/gpu/render/surfaces.cpp	2026-11-11 11:23:40.529003900 +1000
+@@ -323,7 +323,17 @@
+         RGPU_INFO("[sasrt] depth target {:08X} {}x{} made D32F (sasrt_gpu_shadow_d32f)", surface.guest_va, surface.width,
+                   surface.height);
+     }
+-    if (surface.format != DepthTargetFormat()) {
++    // sasrt-nx (2026-11-11, renut_depth_float_no_stencil, a speed trade, off; docs/360-precision-differences.md row 26):
++    // any float depth target (D24FS8) without a stencil plane, as the shadow rule above does for the shadow maps.
++    if (DepthFloatNoStencilOn() && surface.format == plume::RenderFormat::D32_FLOAT_S8_UINT &&
++        (surface.format_word & 0x3F) == u32(GpuTextureFormat::Fmt24_8_Float)) {
++      surface.format = plume::RenderFormat::D32_FLOAT;
++      static uint32_t logged = 0;
++      if (logged++ < 8)
++        RGPU_INFO("[formats] depth target {:08X} {}x{} made D32F without stencil (renut_depth_float_no_stencil)",
++                  surface.guest_va, surface.width, surface.height);
++    }
++    if (surface.format == plume::RenderFormat::D24_UNORM_S8_UINT) {  // sasrt-nx (2026-11-11): only that format's line
+       static uint32_t logged = 0;
+       if (logged++ < 16)
+         RGPU_INFO("Depth target {:08X}: {}x{} x{} samples, 24-bit unorm depth with stencil (banjo_deko3d_depth24)",
+@@ -332,6 +342,20 @@
+   } else {
+     surface.format = SurfaceColorFormat(desc);
+   }
++  // sasrt-nx (2026-11-11, renut_diag_formats): the first target of each guest format / host format / size.
++  if (DiagFormatsOn()) {
++    static std::vector<uint64_t> seen;
++    const uint32_t colour_format = (u32(desc.ColorInfo) >> 16) & 0xF;
++    const uint64_t key = uint64_t(surface.depth) << 63 | uint64_t(surface.format_word & 0x3F) << 50 |
++                         uint64_t(colour_format) << 46 | uint64_t(surface.format) << 32;  // (audit finding 8: no size)
++    if (seen.size() < 96 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
++      seen.push_back(key);
++      RGPU_INFO("[formats] {} target {}x{}: guest format {} ({}), EDRAM colour format {}, host format {}",
++                surface.depth ? "depth" : "colour", surface.width, surface.height, surface.format_word & 0x3F,
++                GpuTextureFormatName(surface.format_word), surface.depth ? -1 : int(colour_format),
++                int(surface.format));
++    }
++  }
+ 
+   plume::RenderDevice *device = Video::Device();
+   const plume::RenderMultisampling multisampling(surface.samples);
+--- app/src/renut_engine/gpu/render/draw.cpp	2026-11-11 09:01:20.477847100 +1000
++++ app/src/renut_engine/gpu/render/draw.cpp	2026-11-11 11:23:40.551045100 +1000
+@@ -9919,7 +9919,16 @@
+ }
+ 
+ // sasrt-nx (2026-11-08, sasrt_gpu_exp_shadow_d32f): stencil used on a depth target made without a stencil plane.
+-void SasrtWarnStencilOnD32f(const HostSurface *d) {
++void SasrtWarnStencilOnD32f(const HostSurface *d, bool clear = false, bool first = false) {
++  // sasrt-nx (2026-11-11, renut_diag_formats; renut_depth_float_no_stencil's question): the first stencil use of each
++  // target build ('first': its stencil_used was still false; audit finding 6: no lookup on every stencil draw).
++  if (first && d && d->depth && DiagFormatsOn()) {
++    static uint32_t logged = 0;
++    if (logged++ < 48)
++      RGPU_INFO("[formats] stencil {} on depth target {:08X} {}x{} (guest format {}, host format {})",
++                clear ? "cleared" : "used by a draw", d->guest_va, d->width, d->height,
++                GpuTextureFormatName(d->format_word), int(d->format));
++  }
+   if (d && d->depth && d->format == plume::RenderFormat::D32_FLOAT) {
+     static uint32_t logged = 0;
+     if (logged++ < 16)
+@@ -11956,8 +11965,9 @@
+       SasrtStampDepthWrite(*targets.depth);  // sasrt-nx (2026-11-08, sasrt_renut_diag_depth_writers)
+     }
+     if (dc & 1) {
++      const bool first_stencil = !targets.depth->stencil_used;  // sasrt-nx (2026-11-11, renut_diag_formats)
+       targets.depth->stencil_used = true;
+-      SasrtWarnStencilOnD32f(targets.depth);  // sasrt-nx (2026-11-08, sasrt_gpu_exp_shadow_d32f)
++      SasrtWarnStencilOnD32f(targets.depth, false, first_stencil);  // sasrt-nx (2026-11-08, sasrt_gpu_exp_shadow_d32f)
+     }
+   }
+   ++s.list_draws;  // Video::NoteDrawLocked
+@@ -14640,8 +14650,9 @@
+       SasrtStampDepthWrite(*targets.depth);  // sasrt-nx (2026-11-08, sasrt_renut_diag_depth_writers)
+     }
+     if (dc & 1) {
++      const bool first_stencil = !targets.depth->stencil_used;  // sasrt-nx (2026-11-11, renut_diag_formats)
+       targets.depth->stencil_used = true;  // banjo-nx (2026-10-19, banjo_deko3d_depth_handover)
+-      SasrtWarnStencilOnD32f(targets.depth);  // sasrt-nx (2026-11-08, sasrt_gpu_exp_shadow_d32f)
++      SasrtWarnStencilOnD32f(targets.depth, false, first_stencil);  // sasrt-nx (2026-11-08, sasrt_gpu_exp_shadow_d32f)
+     }
+   }
+   CensusDraw(device_state, call, targets, vs, ps, vs_constants, ps_constants, prefetch_streams, prefetch_stream_count,
+@@ -15628,8 +15639,9 @@
+       DepthHandOverBeforeBindLocked(t.colors[i], &rect, (flags >> i) & 1u);
+   }
+   if (t.depth && (flags & 0x20)) {
++    const bool first_stencil = !t.depth->stencil_used;  // sasrt-nx (2026-11-11, renut_diag_formats)
+     t.depth->stencil_used = true;
+-    SasrtWarnStencilOnD32f(t.depth);  // sasrt-nx (2026-11-08, sasrt_gpu_exp_shadow_d32f)
++    SasrtWarnStencilOnD32f(t.depth, true, first_stencil);  // sasrt-nx (2026-11-08; 2026-11-11: a clear)
+   }
+   // sasrt-nx (2026-11-09, sasrt_gpu_depth_restore_direct): a restore copy left out in a colour target this clear fills
+   // whole (every channel: clears take no mask) is not needed any more; BindTargets would draw it first.
+@@ -17339,6 +17351,8 @@
+   case plume::RenderFormat::R8G8B8A8_UNORM:
+   case plume::RenderFormat::B8G8R8A8_UNORM:
+   case plume::RenderFormat::R16G16B16A16_UNORM:
++  case plume::RenderFormat::R10G10B10A2_UNORM:  // sasrt-nx (2026-11-11, renut_format_10bit_exact; audit finding 1)
++  case plume::RenderFormat::R11G11B10_FLOAT:    // sasrt-nx (2026-11-11, renut_format_7e3_rg11b10)
+   case plume::RenderFormat::R16G16B16A16_FLOAT:
+   case plume::RenderFormat::R16G16_UNORM:
+   case plume::RenderFormat::R8G8_UNORM:
+--- app/src/renut_engine/gpu/render/textures.cpp	2026-11-10 12:57:38.991996000 +1000
++++ app/src/renut_engine/gpu/render/textures.cpp	2026-11-11 11:23:40.536003700 +1000
+@@ -619,6 +619,18 @@
+   t.dimension = HostDimension(fetch);
+   t.guest_format = fetch.Format();
+   t.info = GetTextureFormatInfo(fetch.Format(), AllSigned(fetch));
++  // sasrt-nx (2026-11-11, renut_diag_formats): the first texture of each guest format / host format.
++  if (DiagFormatsOn()) {
++    static std::vector<uint32_t> seen;
++    const plume::RenderFormat host = render_target ? rt_format : t.info.host;  // a resolve destination's: the target's
++    const uint32_t key = u32(fetch.Format()) << 16 | u32(host) << 1 | (render_target ? 1u : 0u);
++    if (seen.size() < 96 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
++      seen.push_back(key);
++      RGPU_INFO("[formats] first {} of guest format {} ({}): host format {}, {}x{}",
++                render_target ? "resolve destination" : "texture", u32(fetch.Format()), GpuTextureFormatName(u32(fetch.Format())),
++                int(host), width, height);
++    }
++  }
+   t.width = width;
+   t.height = height;
+   t.depth = depth;
+@@ -2108,16 +2120,18 @@
+     RenderScale lod_scale;
+     uint32_t min_anisotropy = 1;
+     uint32_t cuts = 0;  // sasrt-nx (2026-11-09): sasrt::gpu_round::SamplerCutBits
++    bool f32_point = false;  // sasrt-nx (2026-11-11, renut_float32_point_filter): the format is not in the words
+     uint32_t slot = 0;
+   };
+   static Memo memo[256];
+   const uint32_t cuts = sasrt::gpu_round::SamplerCutBits();
+   const uint32_t min_anisotropy = MinAnisotropy();
+   const u32 words[4] = {fetch.dword[0], fetch.dword[3], fetch.dword[4], fetch.dword[5]};
++  const bool f32_point = Float32PointFilterOn() && IsFloat32TextureFormat(fetch.Format());  // sasrt-nx (2026-11-11)
+   Memo &entry = memo[(words[0] * 0x9E3779B1u ^ words[1] * 0x85EBCA6Bu ^ words[2] * 0xC2B2AE35u ^
+-                      words[3] ^ lod_scale.code * 0x27D4EB2Fu) >> 24];
++                      words[3] ^ lod_scale.code * 0x27D4EB2Fu ^ (f32_point ? 0x5BD1E995u : 0u)) >> 24];
+   if (entry.valid && entry.lod_scale == lod_scale && entry.min_anisotropy == min_anisotropy && entry.cuts == cuts &&
+-      std::memcmp(entry.words, words, sizeof(words)) == 0)
++      entry.f32_point == f32_point && std::memcmp(entry.words, words, sizeof(words)) == 0)
+     return entry.slot;
+   const uint32_t slot = SamplerSlotUncached(fetch, lod_scale);
+   entry.valid = true;
+@@ -2125,6 +2139,7 @@
+   entry.lod_scale = lod_scale;
+   entry.min_anisotropy = min_anisotropy;
+   entry.cuts = cuts;
++  entry.f32_point = f32_point;
+   entry.slot = slot;
+   return slot;
+ }
+@@ -2192,6 +2207,23 @@
+       desc.anisotropyEnabled = cap > 1;
+     }
+   }
++  // sasrt-nx (2026-11-11, renut_float32_point_filter; docs/360-precision-differences.md row 38): the Xenos cannot filter
++  // 32-bit float textures and point-samples them whatever the sampler asks; the host filtered them when asked.
++  if (Float32PointFilterOn() && IsFloat32TextureFormat(fetch.Format())) {
++    const bool asked = desc.minFilter == plume::RenderFilter::LINEAR || desc.magFilter == plume::RenderFilter::LINEAR ||
++                       desc.mipmapMode == plume::RenderMipmapMode::LINEAR || desc.anisotropyEnabled;
++    if (asked && DiagFormatsOn()) {
++      static uint32_t logged = 0;
++      if (logged++ < 8)
++        RGPU_INFO("[formats] a 32-bit float texture (guest format {}) asked for filtering: point-sampled "
++                  "(renut_float32_point_filter)", u32(fetch.Format()));
++    }
++    desc.minFilter = plume::RenderFilter::NEAREST;
++    desc.magFilter = plume::RenderFilter::NEAREST;
++    desc.mipmapMode = plume::RenderMipmapMode::NEAREST;
++    desc.anisotropyEnabled = false;
++    desc.maxAnisotropy = 1;
++  }
+   desc.minLOD = float(fetch.MinMipLevel());
+   desc.maxLOD = fetch.MipFilter() == TextureFilter::BaseMap ? float(fetch.MinMipLevel())
+                                                             : float(fetch.MaxMipLevel());
+--- app/src/renut_engine/gpu/render/pipeline.cpp	2026-11-09 21:54:56.761564400 +1000
++++ app/src/renut_engine/gpu/render/pipeline.cpp	2026-11-11 11:23:40.552044400 +1000
+@@ -208,6 +208,7 @@
+   case plume::RenderFormat::R8G8B8A8_UNORM:
+   case plume::RenderFormat::B8G8R8A8_UNORM:
+   case plume::RenderFormat::R16G16B16A16_UNORM:
++  case plume::RenderFormat::R10G10B10A2_UNORM:  // sasrt-nx (2026-11-11, renut_format_10bit_exact; audit finding 2)
+   case plume::RenderFormat::R8G8_UNORM:
+   case plume::RenderFormat::R8_UNORM:
+   case plume::RenderFormat::R16G16_UNORM:
+@@ -258,6 +259,8 @@
+   case F::R16G16_FLOAT:
+   case F::R32G32_FLOAT:
+     return 0x3;
++  case F::R11G11B10_FLOAT:  // sasrt-nx (2026-11-11, renut_format_7e3_rg11b10; audit finding 2): no alpha
++    return 0x7;
+   default:
+     return 0xF;
+   }

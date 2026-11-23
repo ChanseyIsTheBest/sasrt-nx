@@ -1,0 +1,174 @@
+# optimised codegen: written by tools\codegen.ps1 -Flavor optimised from perf_overrides.toml.
+# Code generation options for speed: the "optimised codegen" flavour (tools\codegen.ps1, whose default -Flavor optimised
+# copies this file to codegen_flavor.toml, which sasrt_manifest.toml includes; -Flavor classic, for diagnosis on the PC
+# only, writes an empty one). Root keys: they must stay outside any table. Build-time: every build has them, and the SD
+# card gets this one NRO (the user's rule of 2026-10-06; docs/enhancements.md, "Build-time").
+#
+# The options only change how the C++ is written, so the compiler can keep guest state in host registers and drop dead
+# stores; the guest-visible result is the same. The set started as sa2-nx's (masseffect-nx's measured
+# perf_overrides.toml minus what needs per-function marks):
+#   - cr0-cr7, ctr, xer and the lwarx reservation as C++ locals (UnleashedRecomp-NX and MarathonRecomp-NX ship the same);
+#   - skip_msr: no mfmsr/mtmsrd fences, ctx.msr stores or global lock around the guest atomic sequences (a stwcx. is
+#     already a compare-and-swap);
+#   - dform_disp_split: D-form loads/stores as base + zext(reg) + disp (differs only when reg + disp crosses 2^32, a
+#     guest fault either way);
+#   - fctiwz_inline: fctiwz as fcvtzs + NaN select.
+# Masseffect-nx measured skip_msr + reserved_as_local at -3.4 % total CPU and the "diet" (with elide_lr_stores) at -10 %
+# main thread. This game has no setjmp/longjmp (stage 2 sweep), so the locals never need restoring after a longjmp.
+#
+# Added 2026-10-07 (the codegen round for the game threads; masseffect-nx: non_volatile_as_local +9 % fps, 1.09 M
+# ctx.r14-r31 uses down to 4 k, 35 k save/restore helper calls removed):
+#   - non_volatile_as_local: r14-r31, f14-f31, v14-v31 and v64-v127 as C++ locals, and the calls to the save/restore
+#     helpers (__savegprlr_N, __restgprlr_N, __savefpr_N, ...) dropped: 27,730 GPR helper calls (11,959 bl in the
+#     prologues, 15,771 b in the epilogues). Safety: tools\read_before_write.py on code generated with it (no marks)
+#     lists every function that reads one of those registers, or cr/ctr/xer, on some path before writing it (a
+#     fragment split off its owner would need share_registers). It finds 3 of 134,918, all false alarms checked by
+#     hand: sub_82CBCB10 and sub_82CBCEA0 (xor r30,r30,r30: zero whatever r30 held) and sub_82D9F208
+#     (subfe r29,r29,r29: CA - 1 whatever r29 held). SEH funclets are marked share_registers by the generator itself
+#     (FunctionGraph funclet sweep: 86 funclets, and all 31 calls to them hand the registers over through ctx; none
+#     can be reached by an indirect call, futari-nx's crash with this option). No function keeps a vector
+#     constant in v64-v127 across calls (banjo-nx's engine does: non_volatile_vmx128_as_local there); no native hook
+#     reads ctx.r14-r31 or ctx.f14-f31. Needs the helper names: tools\thunk_table.py used to declare 82 helper
+#     entries as plain functions (named sub_X, so their calls were not dropped).
+#   - elide_lr_stores: no `ctx.lr = <return address>` before each call. Checked on the generated code: all 33,013
+#     mflr results are prologue saves (21,050 stored to the stack frame, the rest handed to the save helpers), the one
+#     blrl jumps to an explicit mtlr r3, and the only native reader of ctx.lr is the diagnostic sasrt_d3d_trace
+#     (its "from" column needs code generated without this option). The guest-thread profile of switch_profile_stacks samples the
+#     host x30, not the guest LR.
+# Correction 2026-10-07 ~06:50 (banjo-nx's finding): tools\read_before_write.py took every vector instruction for a
+# memory store (they are written simde_mm_store_*(vD, ...) into the destination register), so no vector register
+# read before its write was ever reported. Fixed, it finds 9 functions that read v29, v120 or v124-v127 on some
+# path before writing them: uninitialized registers on rare or impossible paths (sub_827772F0 and sub_82E3D098,
+# bounding boxes of an empty list, read the caller's v126/v127; sub_82C6CFF8 uses v126 when no branch set it...).
+# On the 360 such a read gets whatever the caller chain left there, with locals 0. Only ctx keeps that exact, so
+# non_volatile_vector_as_local = false (an option added to this SDK) keeps v14-v31 and v64-v127 in ctx in every
+# function, with the VMX save/restore helper calls that preserve them. r14-r31 and f14-f31 stay locals: the fixed
+# check finds no GPR or FPR read before its write (including those inside vector instructions). Cost: the 19,182
+# vector ctx uses of before stay, out of the ~732,000 the round removed.
+#
+# Added 2026-10-07 evening (sa2-nx's, with this port's own vector rule): non_argument_as_local: r0, r2, r11, r12 and f0
+# as C++ locals. MSVC uses r11, r12 and f0 as scratch everywhere: 1.17 M ctx.r11, 111 k ctx.r12 and 58 k ctx.f0 uses
+# in the generated code before (sa2-nx: -5.6 % instructions and -8.8 % loads/stores in its game functions).
+# tools\non_argument_audit.py (sa2-nx's; whole program, on code generated without the option; it splits the inlined
+# thunk calls first) lists every value that crosses a call in those registers (docs/enhancements.md has the list):
+#   - read on entry: the EH/SEH funclets (r12, the owner's frame: share_registers already, their owners hand it over),
+#     the __save*/__rest* helpers (r12/r11; kept in ctx by name, and the VMX ones' calls stay), the stack probe
+#     0x82C8EEC4 (frame size in r12, called through its jump thunk 0x824A3E60), and 15 vector functions (below);
+#   - read after a call: 58 callers of the stack probe go on with its r12 (stwux r1,r1,r12); one owner reads the r11
+#     its __finally funclet loads (share_registers: the copy-back takes it); the rest follow calls that never return
+#     (the throw path 0x8240A2B0 -> 0x82C8D170, KeBugCheck's and ExTerminateThread's jump thunks, _CxxThrowException);
+#   - r2: written only by the CRT's context restore 0x82CA77CC (from a CONTEXT record; jump thunk 0x82441870); its
+#     one reader is a one-instruction gap fragment that nothing calls.
+# non_argument_as_local_keep (sa2-nx's generator option, ported): those four keep r0/r2/r11/r12/f0 in ctx and localize
+# the rest; a caller hands its locals over around the call and takes them back. The two thunks are listed so their
+# callers hand over too (tools\thunk_calls.py then leaves them alone: every address in this file counts as hooked).
+# non_argument_vector_as_local = false (an option added to this SDK): v32-v63 stay in ctx. 15 functions read lanes of
+# them they never wrote (vrlimi128 blends, vsldoi shift registers, element-wise ops on part of a register): the 360
+# gives them the caller's bytes, a local zeros, and tools\vec_shiftout.py does not model their instructions.
+#
+# Added 2026-10-07 ~06:10, sa2-nx's round 7: fp_moves_modeless (generator option ported from sa2-nx's SDK: config.h,
+# config.cpp, builders/context.cpp + builder_context.h, memory.cpp, floating_point.cpp, ppc/diet_ops.h). The 360's VMX
+# unit flushes denormals and its FPU does not, so the generator switches the host flush mode around scalar float
+# instructions in VMX code. On AArch64 every switch is an `msr fpcr`, which the A57 serializes: sa2-nx's VMX-heavy
+# game thread had 20-26 % of its console samples right after one. With the option, float moves (lfd/stfd forms,
+# stfiwx, fmr, fabs, fnabs, fneg) switch nothing, since only bits move. In VMX mode lfs/stfs convert through
+# rex::ppc::SingleToDoubleAnyMode / DoubleToSingleAnyMode, which give the IEEE result in either mode; only a denormal
+# single, or a result in the single denormal range, takes a cold path with the mode cleared for that instruction.
+# Exact by construction (sa2-nx unit-tested both modes; its lockstep frames stayed pixel-identical).
+#
+# Post-codegen steps of the flavour (tools\post_codegen.py): tools\pch_no_volatile.py (guest memory without volatile;
+# masseffect-nx: +15-20 % fps), tools\thunk_calls.py (calls through the .xidata jump thunks go straight to their
+# target: 127,648 call sites) and tools\direct_calls.py (calls between unhooked functions become direct).
+cr_as_local = true
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+skip_msr = true
+dform_disp_split = true
+fctiwz_inline = true
+non_volatile_as_local = true
+elide_lr_stores = true
+fp_moves_modeless = true
+# Added 2026-10-12: fp_compares_modeless (generator option of this SDK: config.h, config.cpp, builders/context.cpp +
+# builder_context.h, floating_point.cpp, ppc/diet_ops.h). What fp_moves_modeless did for the float loads and stores,
+# for the scalar instructions the generator still switched the flush mode for:
+#   - fcfid (integer to double), fctiwz / fctidz (truncation: a denormal gives 0 either way) and fsel (its test done
+#     on the bits) cannot be changed by the mode: no switch and no check in any state;
+#   - fcmpu / fcmpo and frsp between VMX instructions go through rex::ppc::CompareAnyMode / RoundToSingleAnyMode:
+#     only a denormal operand (or a result in the single denormal range) takes a cold path with the mode cleared.
+# Before: 470 fcmpu, 25 fsel, 16 frsp and 16 fcfid sites wrote the mode unconditionally (and the next VMX instruction
+# wrote it back: two `msr fpcr` each on the A57), and 1,216 fcfid / fsel / fctiwz / fctidz sites checked it.
+# sdk/tests/fp_any_mode_test.cpp compares every helper with the plain operation in both modes.
+fp_compares_modeless = true
+# Added 2026-10-12, after the PC census of flush-mode switches by code address (sasrt_diag_runtime_census,
+# tools/census_sites.py: 1.4-2.1 million switches a second in a race, each an `msr fpcr` on the console):
+# fp_mode_lookahead. Before a scalar float instruction switches the mode, the generator looks at the next instruction
+# that needs a particular one (BuilderContext::next_float_demand):
+#   - float loads and stores, frsp and fcmpu use their any-mode forms whenever the mode is not known to be FPU and
+#     vector code, a branch or a return comes next (before: only when the mode was known to be VMX; a function that
+#     starts with `lfs` and goes on with vector code switched off at the lfs and on again at the vector instruction
+#     on every call from vector code);
+#   - one or two fadds / fsubs / fmuls / fdivs between vector instructions compute in the current mode
+#     (rex::ppc::*SingleAnyMode: operands tested for denormal doubles, a zero double result accepted only where it
+#     is exact, the rounding through RoundToSingleAnyMode; everything else recomputed with the mode cleared).
+# sdk/tests/fp_any_mode_test.cpp compares every helper with the plain operation in both modes.
+fp_mode_lookahead = true
+# sasrt-nx (2026-11-12, docs/cpu-moonshots-1112.md idea 1): runs of up to this many scalar single operations between
+# vector code take their any-mode forms instead of two flush-mode writes (generator default 2, a guess). The console
+# measured a toggling FPCR write at 44 ns (~45 cycles): two writes (~90 cycles) cost more than up to four any-mode
+# operations. Exact either way (the any-mode forms: sdk/tests/fp_any_mode_test.cpp, 600 million comparisons).
+# 2026-11-12 20:15: back to the generator's 2. The console A/B (abCC2 against a same-session CC1 control) showed the
+# any-mode forms costing more in the water step's loop (sub_828729E8 389 -> 474 samples: denormal checks and vector
+# spills, same FPCR writes) than the switches they saved (flush-switch samples 2.18 -> 1.77 %): idea 1 dropped.
+fp_mode_lookahead_run = 2
+# sasrt-nx (2026-11-12, idea 1 part 2): fmadds / fmsubs / fnmadds / fnmsubs between vector code take exact any-mode
+# forms too (they always switched to FPU mode and back before): sdk/tests/fp_fused_any_mode_test.cpp, 160 million
+# comparisons in both modes, 0 differences (negative control positive).
+fp_fused_single_any_mode = false  # 2026-11-12 20:15: off with idea 1 (see above); exact, kept in the generator
+# Added 2026-10-12 (round 2): rotate_word_narrow. rlwinm / rlwnm / rlwimi with a mask that does not wrap (mb <= me:
+# slwi, srwi, clrlwi, extrwi, insrwi and almost every other use) are a 32-bit rotate and a 32-bit mask instead of a
+# 64-bit rotate of the word duplicated into both halves: only a wrapping mask reaches the upper half. 43,793 sites
+# were written the long way, three instructions each on AArch64 (orr with the shifted copy, ror, and) where a shift,
+# a bit-field extract or an AND does it. sdk/tests/rotate_word_test.cpp compares both forms for every shift and
+# mask.
+rotate_word_narrow = false
+# 2026-10-13: OFF. sa2-nx measured it with the Switch compiler on three recompiled files: 0.07-0.12 % MORE
+# instructions (GCC folds the 64-bit form of an srwi into one lsr and the narrow one into ror + and; extracts and
+# rlwnm get shorter, shifts longer). Exact either way; the option stays for a compiler that does better with it.
+#
+# sa2-nx's CPU rounds 2 and 3 of 2026-10-12, generator options (its SDK changes merged into this SDK 2026-10-13):
+# fcti_inline: fctid / fctiw / fctidz through rex::ppc helpers. On AArch64 the simde forms of fctid / fctiw rounded
+#   exact halves AWAY from zero (C round(), one fcvtas); the 360 and the PC build round to even / in the current
+#   mode. The helper is frinti + a saturating fcvtzs. A correction of the Switch build (12 sites here), and fctidz as
+#   the instruction.
+# fp_copy_pairs: an lfs whose register is only stored again by stfs (a float copied through a register) keeps the
+#   bits in a local and needs no mode, where VMX mode is known to be current.
+# div_inline: divw / divwu / divd / divdu through rex::ppc helpers: on AArch64 the instruction and, for the signed
+#   ones, one select (sdiv / udiv define the zero divisor), instead of the guarded C expression's branches.
+# fp_mode_lookahead_past_branch = false (sa2-nx's option; being measured here 2026-10-13): the any-mode forms only where
+# they replace a switch for certain (a vector instruction comes next, or VMX mode is known current), not on the bet
+# that a switch may come later. With the bet (true, this port's rule of 2026-10-12) the PC census of a race counted
+# 253,000 any-mode operations a frame (214,000 conversions, 29,000 compares, 9,800 arithmetic) for about 30,000
+# switches a frame left of 60,800.
+fp_mode_lookahead_past_branch = false
+fcti_inline = true
+fp_copy_pairs = true
+div_inline = true
+non_volatile_vector_as_local = false
+non_argument_as_local = true
+non_argument_vector_as_local = false
+non_argument_as_local_keep = [0x82C8EEC4, 0x824A3E60, 0x82CA77CC, 0x82441870]
+# banjo-nx's generator options of 2026-10-16 to 2026-10-19, ported 2026-10-19 (docs/enhancements.md, "banjo-nx's
+# codegen rounds"):
+# rotate_word_shifts: rlwinm / rlwimi with a non-wrapping mask as the shift, extract or 32-bit rotate the mask makes of
+#   them ((x << sh) & m, (x >> (32 - sh)) & m, rotl32(x, sh) & m): lsl / lsr / ubfiz / ubfx, one instruction, where
+#   rotate_word_narrow's rotate-and-mask did not get there with GCC. banjo-nx: -0.59 % instructions on 12 files.
+#   sdk/tests/rotate_word_test.cpp: 5,136,384 comparisons with the old forms, 0 differences.
+# fp_copy_forwarding: with fp_copy_pairs, a float copied through a register keeps its bits in any mode and through
+#   other instructions and an in-place fneg / fabs / fnabs (the stored bits (bits & keep) ^ flip).
+# dcbt_prefetch: the game's dcbt / dcbtst hints as the host's prefetch of the same address (a prefetch changes no value
+#   and never faults). Its operands are read as {CT, RA, RB} since the fix of 2026-10-16 (banjo-nx's find); CMake
+#   SASRT_GEN_DCBT_PREFETCH=OFF compiles them to nothing.
+rotate_word_shifts = true
+fp_copy_forwarding = true
+dcbt_prefetch = true

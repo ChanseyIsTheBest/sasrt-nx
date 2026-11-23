@@ -1,0 +1,2996 @@
+--- base/app/src/renut_engine/gpu/render/draw.cpp
++++ sasrt-nx/app/src/renut_engine/gpu/render/draw.cpp
+@@ -1188,11 +1488,23 @@
+   uint64_t checked = UINT64_MAX;  // renut-ultimate (audit): the frame HeldExportOverwritten last looked
+   bool overwritten = false;
+ };
+ std::map<u32, HeldExport> g_held_exports;
++// sasrt-nx (2026-11-20, sasrt_rt2_held_export_bitmap): the 64 KB granules of the 512 MB physical space a kept export's
++// bytes may lie in (a superset: set at every hold, made again from the map when the frame's start drops some).
++uint64_t g_held_granules[8192 / 64] = {};
++inline void HeldGranulesMark(u32 base, u32 size) {
++  const u32 first = (base & 0x1FFFFFFFu) >> 16;
++  const u32 last = std::min<u32>(((base & 0x1FFFFFFFu) + size - 1u) >> 16, 8191u);
++  for (u32 g = first; g <= last; ++g)
++    g_held_granules[g >> 6] |= 1ull << (g & 63u);
++}
++[[gnu::always_inline]] inline bool HeldGranuleMayHold(u32 phys) {
++  const u32 g = (phys & 0x1FFFFFFFu) >> 16;
++  return (g_held_granules[g >> 6] >> (g & 63u)) & 1u;
++}
+ std::vector<std::shared_ptr<std::vector<u8>>> g_held_retired;
+-// sasrt-nx (2026-11-12, batch C/D, item D2; port 93): retired buffers nothing points into any more (the flush), for the
+-// next holds.
++// sasrt-nx (2026-11-12, batch D2): retired buffers nothing points into any more (the flush), for the next holds.
+ std::vector<std::shared_ptr<std::vector<u8>>> g_held_pool;
+ uint64_t g_held_reads = 0;
+ // Keeps an export's results ('size' bytes at 'data', physical base 'base'), dropping kept ones it overlaps.
+ void HoldExport(u32 base, const u8 *data, u32 size, uint64_t frame) {
+@@ -1209,9 +1521,10 @@
+     g_held_retired.push_back(std::move(it->second.data));
+     it = g_held_exports.erase(it);
+   }
+   HeldExport &h = g_held_exports[base];
+-  if (!g_held_pool.empty()) {  // sasrt-nx (2026-11-12, batch C/D, item D2; port 93): a pooled buffer, the same bytes
++  HeldGranulesMark(base, size);  // sasrt-nx (2026-11-20, sasrt_rt2_held_export_bitmap)
++  if (!g_held_pool.empty()) {  // sasrt-nx (2026-11-12, batch D2): a pooled buffer, the same bytes
+     h.data = std::move(g_held_pool.back());
+     g_held_pool.pop_back();
+     h.data->assign(data, data + size);
+   } else {
+@@ -1487,11 +1798,32 @@
+   // banjo-nx (2026-10-23, render-thread round): the slot holds the key's hash and the entry; the key is compared in the
+   // node, whose line the draw reads next for the entry's fields anyway (libstdc++ keeps the key at the node's start).
+   // Slots of 16 bytes rather than a key each: four times as many in less memory. The city's 5,000 draws a frame missed
+   // the 4,096 / 2,048 slots of before often enough to spend 2.5 % of the console's render thread in the maps' buckets.
++  // sasrt-nx (2026-11-20, sasrt_rt4_stream_memo_two_way; the third table's #16): two ways, the slot and its pair (the
++  // same line): the most recently used kept in the first (a hit in the second swaps them; a new entry pushes the first
++  // into the second). Four views' streams and indices (thousands of keys a frame) conflicted in the direct-mapped slots,
++  // each conflict a map lookup (the bucket's and the node's lines).
++  static bool TwoWay() { return sasrt::gpu_round::On(sasrt::gpu_round::kRt4StreamMemoTwoWay); }
+   Entry *Find(const typename Map::key_type &key, size_t hash) const {
+-    const Slot &slot = slots_[Index(hash)];
+-    return slot.hash == hash && slot.entry && slot.entry->first == key ? slot.entry : nullptr;
++    const u32 i = Index(hash);
++    const Slot &slot = slots_[i];
++    if (slot.hash == hash && slot.entry && slot.entry->first == key)
++      return slot.entry;
++    if (!TwoWay())
++      return nullptr;
++    Slot &other = const_cast<Slot &>(slots_[i ^ 1u]);
++    if (other.hash == hash && other.entry && other.entry->first == key) {
++      std::swap(const_cast<Slot &>(slot), other);
++      return slots_[i].entry;
++    }
++    return nullptr;
++  }
++  void Place(size_t hash, Entry *entry) {
++    const u32 i = Index(hash);
++    if (TwoWay() && slots_[i].entry && slots_[i].entry != entry)
++      slots_[i ^ 1u] = slots_[i];
++    slots_[i] = {hash, entry};
+   }
+ 
+   // The map's entry for 'key', made if 'make' (else null when it has none).
+   Entry *Get(Map &map, const typename Map::key_type &key, bool make) { return Get(map, key, Hash{}(key), make); }
+@@ -1787,8 +2124,33 @@
+         const uint32x4_t newer = vorrq_u32(vcgeq_u32(vld1q_u32(serials), p), vcgeq_u32(vld1q_u32(serials + 4), p));
+         if (vmaxvq_u32(newer) != 0)
+           clean = false;
+         page += 7;  // the loop's ++page makes 8
++        continue;
++      }
++    }
++    // sasrt-nx (2026-11-20, sasrt_rt2_pages_tail; the second render-thread round): a range's last 1-7 pages (most vertex
++    // ranges are that short) in one block the same way, the lanes past the range masked: their cards read as written-
++    // never and their serials as old. Loads stay inside the card table and g_page_serial (page + 8 <= 0x20000).
++    if (!diag && page != 0 && last - page < 7 && page + 8 <= 0x20000u && (page + 8 <= 0x1000u || page >= 0x1000u) &&
++        sasrt::gpu_round::On(sasrt::gpu_round::kRt2PagesTail)) {
++      static const uint8_t kLanes8[8] = {0, 1, 2, 3, 4, 5, 6, 7};
++      static const uint32_t kLanes32[8] = {0, 1, 2, 3, 4, 5, 6, 7};
++      const u32 n = last - page + 1;
++      const uint8x8_t outside = vcge_u8(vld1_u8(kLanes8), vdup_n_u8(u8(n)));
++      const uint8x8_t ca = vld1_u8(cards + 0xA0000u + page), cc = vld1_u8(cards + 0xC0000u + page);
++      const uint8x8_t ce = vld1_u8(cards + 0xE0000u + page - 1);
++      const uint8x8_t cf = page < 0x1000u ? vld1_u8(cards + 0x7F000u + page) : ca;
++      if (vminv_u8(vorr_u8(vmin_u8(vmin_u8(ca, cc), vmin_u8(ce, cf)), outside)) != 0) {
++        const uint32x4_t nn = vdupq_n_u32(n), p = vdupq_n_u32(u32(proven));
++        const u32 *serials = g_page_serial + page;
++        const uint32x4_t newer =
++            vorrq_u32(vandq_u32(vcgeq_u32(vld1q_u32(serials), p), vcltq_u32(vld1q_u32(kLanes32), nn)),
++                      vandq_u32(vcgeq_u32(vld1q_u32(serials + 4), p), vcltq_u32(vld1q_u32(kLanes32 + 4), nn)));
++        if (vmaxvq_u32(newer) != 0)
++          clean = false;
++        sasrt::gpu_round::Count(sasrt::gpu_round::kRt2PagesTail);
++        page += n - 1;  // the loop's ++page makes n
+         continue;
+       }
+     }
+ #endif
+@@ -3688,8 +4710,35 @@
+     g_const_same += diff == 0;
+     if (diff)
+       push |= uint64_t(1) << bit;
+   }
++  // sasrt-nx (2026-11-20, sasrt_rt4_push_runs_merged; the third table's #26): two runs of groups to push that one or two
++  // groups separate are pushed as one: the groups between them go too, with the device's current bytes (the loop below
++  // copies all four registers of a group and makes them valid, as for any group it pushes), so one dkCmdBufPushConstants
++  // call instead of two. Never across a group holding a literal register (this shader's or the buffer's): the device's
++  // bytes would overwrite the literal.
++  if (push && sasrt::gpu_round::On(sasrt::gpu_round::kRt4PushRunsMerged)) {
++    uint64_t gaps = 0;
++    for (uint64_t rest = push; rest;) {
++      const u32 first = u32(std::countl_zero(rest));          // the lowest group left (group g is bit 63 - g)
++      const u32 end = first + u32(std::countl_one(rest << first));  // the group after its run
++      rest = end >= 64 ? 0 : rest & (~uint64_t(0) >> end);    // the groups from 'end' on
++      if (!rest)
++        break;
++      const u32 next = u32(std::countl_zero(rest));
++      if (next - end > 2)
++        continue;
++      bool free = true;
++      for (u32 g = end; g < next && free; ++g)
++        free = !(((own_literals ? own_literals[g / 8] : 0u) | last.literal_regs[g / 8]) >> (g % 8 * 4) & 0xFu);
++      for (u32 g = end; free && g < next; ++g)
++        gaps |= uint64_t(1) << (63 - g);
++    }
++    if (gaps) {
++      push |= gaps;
++      sasrt::gpu_round::Count(sasrt::gpu_round::kRt4PushRunsMerged, uint64_t(std::popcount(gaps)));
++    }
++  }
+   // The updates, a run of consecutive groups at a time.
+   uint64_t pushed_bytes = 0;
+   bool overwrote_literal = false;
+   for (uint64_t remaining = push; remaining;) {
+@@ -3886,11 +4935,15 @@
+ constexpr u32 kSharedLines = (u32(sizeof(SharedConstants)) + 63) / 64;
+ constexpr u32 kAllSharedLines = (1u << kSharedLines) - 1;
+ static_assert(kSharedLines == 25);  // halo3-nx: 22 before the loop constants (24); renut-ultimate: the clip planes; the tail, bit 24, is still 16 bytes
+ u32 g_sc_dirty = kAllSharedLines;
+-// banjo-nx (2026-11-21, the spec answers kept): the lines of g_draw_sc written with a new value since the fast path last
+-// made its spec answers (every push adds g_sc_dirty; a push of another block, all lines). FastDrawLocked clears it.
++// banjo-nx (2026-11-21, the spec answers kept; the base, port 251): the lines of g_draw_sc written with a new value since
++// the fast path last made its spec answers. sasrt-nx: kept for the base's SpecKeep code, which SASRT's FastDrawLocked
++// does not use (its own spec memo, sasrt_rt2_spec_memo, keeps the answers).
+ u32 g_spec_lines_seen = ~0u;
++// sasrt-nx (2026-11-20, sasrt_rt2_spec_memo): the lines of g_draw_sc pushed (so written) since the spec memo was taken;
++// with g_sc_dirty (written since the last push) every line written since.
++u32 g_sc_dirty_seen = ~0u;
+ // banjo-nx (2026-10-28, per-draw night): the lines from the first to the last as one mask (a loop a line before, run at
+ // every mark the compiler could not fold: FillTextures' slot words, the fields of a block passed by reference).
+ constexpr u32 SharedLinesOf(size_t offset, size_t size) {
+   if (!size)
+@@ -3963,19 +5016,20 @@
+ void PushSharedConstants(plume::RenderCommandList *cmd, const SharedConstants &sc, u32 equal_lines = 0) {
+   ::renut::gpu::census::Scope census_scope(::renut::gpu::census::kPushConstants);  // blur-nx (2026-11-17)
+   constexpr u32 kLine = 64;
+   constexpr u32 kSize = u32(sizeof(SharedConstants));
++  constexpr u32 kUboSize = (kSize + 255u) & ~255u;  // sasrt-nx (2026-11-04): DK_UNIFORM_BUF_ALIGNMENT
+   ++g_shared_pushes;
+   const uint64_t ubo = g_pushed_buffers.address + kPushedSharedOffset;
+   const u8 *now = reinterpret_cast<const u8 *>(&sc);
+   u8 *held = reinterpret_cast<u8 *>(&g_bound.pushed_shared);
+   uint64_t pushed_bytes = 0;
+   // banjo-nx (2026-10-26, API-level stage 1): the persistent block's lines are known: those written with a new value
+   // since its last push (g_sc_dirty), the held copy being the block in every other line.
+   const bool tracked = &sc == &g_draw_sc;
+-  g_spec_lines_seen |= tracked ? g_sc_dirty : ~0u;  // banjo-nx (2026-11-21): the spec answers kept
++  if (tracked)
++    g_sc_dirty_seen |= g_sc_dirty;  // sasrt-nx (2026-11-20, sasrt_rt2_spec_memo): the lines written since the memo
+   if (!g_bound.pushed_shared_valid) {
+-    g_spec_lines_seen = ~0u;  // banjo-nx (2026-11-21): a whole push does not need the marks, so trust none
+     DiagPushLines(0, kSharedLines);  // banjo-nx (2026-10-28, diagnostic)
+     banjo::renut_gpu::record::PushUniform(cmd, ubo, kSize, 0, now, kSize);
+     std::memcpy(held, now, kSize);
+ #if defined(PLUME_DEKO3D)
+@@ -4225,9 +5279,22 @@
+ TextureSlotMemo g_texture_slot_memo[kTextureMemoEntries];
+ 
+ inline TextureSlotMemo &TextureMemoSlot(u32 texture_va, const TextureFetch &fetch) {
+   static_assert(kTextureMemoEntries == 1u << 12);
+-  return g_texture_slot_memo[((texture_va ^ (fetch.dword[0] * 0x85EBCA6Bu) ^ fetch.dword[1]) * 0x9E3779B1u) >> 20];
++  const u32 h = (texture_va ^ (fetch.dword[0] * 0x85EBCA6Bu) ^ fetch.dword[1]) * 0x9E3779B1u;
++  // sasrt-nx (2026-11-20, sasrt_rt2_texture_memo_two_way; the second render-thread round's #2): 2,048 sets of two (the
++  // same 4,096 entries): the entry of this texture and fetch words when either way holds it, else the way bound in an
++  // earlier frame (the four-player race missed ~1,950 a second by "another entry", each a whole BindTextureLocked). Every
++  // use checks the entry's words as before, so an entry stored under the other mapping (the A/B's other half) is only
++  // a miss.
++  if (sasrt::gpu_round::On(sasrt::gpu_round::kRt2TextureMemoTwoWay)) {
++    TextureSlotMemo *const set = &g_texture_slot_memo[(h >> 21) << 1];
++    for (u32 w = 0; w < 2; ++w)
++      if (set[w].va == texture_va && SameBytes<24>(set[w].device, fetch.dword))
++        return set[w];
++    return set[0].frame <= set[1].frame ? set[0] : set[1];
++  }
++  return g_texture_slot_memo[h >> 20];
+ }
+ 
+ // banjo-nx (2026-10-20, from sa2-nx, banjo_renut_chain_reuse): 'slot_fx' (32 entries, or null) receives each bound slot's effects (its
+ // memo entry's on a hit, the bind's otherwise) and 'all_memo' whether every bound slot went through the memo (a
+@@ -6720,9 +7843,12 @@
+   plume::RenderIndexBufferView index_view{};
+   CachedIndices *ci = nullptr;
+   CachedStream *copies[kMaxVertexStreams] = {};
+ };
+-WholeRepeat g_whole_repeat;
++// sasrt-nx (2026-11-20, sasrt_rt2_repeat_ring; the second render-thread round's #41): the last four answers, not one
++// (draws that take turns between a few meshes of one kick: a kart's body and wheels, a view's props); [0] alone off.
++WholeRepeat g_whole_repeats[4];
++u32 g_whole_repeat_next = 0;
+ [[gnu::always_inline]] inline void WholeRepeatWords(const GuestDevice &device, u32 stream, u32 w[4]) {
+   const u32 fetch_index = d3d::kFirstVertexFetchIndex + d3d::StreamFetchIndex(stream);
+   w[0] = device.VertexFetchWord(fetch_index, 0);
+   w[1] = device.VertexFetchWord(fetch_index, 1);
+@@ -6747,9 +7882,13 @@
+     if (!c || !c->copy || c->proven_flush != g_flush_serial)
+       return false;
+   }
+   if (call.indexed) {
+-    const auto *ib = GuestPtr<const d3d::IndexBuffer>(device.U32(d3d::kDeviceOffsetIndexBuffer));
++    // sasrt-nx (2026-11-20, sasrt_rt2_repeat_recorded_index): the header as the replay recorded it (WholeGeometryTry's).
++    const u32 ib_va = device.U32(d3d::kDeviceOffsetIndexBuffer);
++    const auto *ib = sasrt::gpu_round::On(sasrt::gpu_round::kRt2RepeatRecordedIndex)
++                         ? ReplayIndexBuffer(ib_va)
++                         : GuestPtr<const d3d::IndexBuffer>(ib_va);
+     if (!ib || u32(ib->resource.Common) != r.ib[0] || u32(ib->Address) != r.ib[1] || u32(ib->Size) != r.ib[2] ||
+         call.count > r.index_total || call.start_index > r.index_total - call.count || !r.ci || !r.ci->copy ||
+         r.ci->proven_flush != g_flush_serial)
+       return false;
+@@ -8031,8 +9226,111 @@
+       s.w[18 + r / 4] |= (0x80u | ((sc.texture_indices[2][r] >> 20) & 63u)) << (8 * (r & 3));
+     }
+   }
+   return s;
++}
++
++// sasrt-nx (2026-11-20, sasrt_rt2_spec_memo; the second render-thread round): a fast draw's four spec answers, the draw
++// before's when nothing they read can have changed: no line of the persistent shared constants written since
++// (g_sc_dirty_seen | g_sc_dirty: the push trusts the same marks), the same vertex shader record and entries, instancing,
++// A/B halves, sampler table and targets with their colour words. A vertex shader that exports reads its float constants
++// (SasrtExportFormatWords): always computed.
++struct SasrtSpecAnswers {
++  FetchSpec fetch;
++  u32 plain = 0, clip = 0;
++  SasrtSpecWords words;
++};
++struct SasrtSpecMemo {
++  bool valid = false;
++  bool per_instance = false;
++  int ab = 0, ab_now = 0;
++  const ShaderRecord *vs = nullptr;
++  const ShaderCacheEntry *vs_entry = nullptr, *ps_entry = nullptr;
++  uint64_t sampler_gen = 0;
++  u32 color_count = 0;
++  const HostSurface *colors[4] = {};
++  u32 color_info[4] = {};
++  SasrtSpecAnswers a;
++};
++SasrtSpecMemo g_spec_memo;
++// sasrt-nx (2026-11-20, sasrt_rt4_spec_key_skip; the third table's #27): the memo's answers' generation (one more at each
++// store) and whether the last call's answers are the memo's (a hit).
++uint64_t g_spec_memo_gen = 1;
++bool g_spec_memo_hit = false, g_spec_memo_stored = false;
++// A count of every pipeline key written where the fast path keeps a pointer to one (the cache's entries, FastState::key).
++uint64_t g_sasrt_key_writes = 0;
++[[gnu::always_inline]] inline void SasrtSpecAnswersOf(const SharedConstants &sc, const ShaderRecord &vs,
++                                                      const ShaderCacheEntry *ps_entry, bool per_instance, int ab_off,
++                                                      const FloatConstants &vsc, const Targets &targets,
++                                                      SasrtSpecAnswers &out) {
++  const int ab_now = banjo::renut_gpu::g_ab_off.load(std::memory_order_relaxed);
++  const u32 colors = std::min<u32>(targets.color_count, 4u);
++  const bool memo = &sc == &g_draw_sc && targets.color_count <= 4 &&
++                    !(vs.entry && vs.entry->memExportConstants[0]) &&
++                    sasrt::gpu_round::On(sasrt::gpu_round::kRt2SpecMemo);
++  SasrtSpecMemo &m = g_spec_memo;
++  g_spec_memo_hit = g_spec_memo_stored = false;
++  if (memo && m.valid && (g_sc_dirty_seen | g_sc_dirty) == 0 && m.vs == &vs && m.vs_entry == vs.entry &&
++      m.ps_entry == ps_entry && m.per_instance == per_instance && m.ab == ab_off && m.ab_now == ab_now &&
++      m.sampler_gen == g_sasrt_sampler_generation && m.color_count == targets.color_count) {
++    bool same = true;
++    for (u32 i = 0; i < colors; ++i)
++      same &= m.colors[i] == targets.colors[i] &&
++              m.color_info[i] == (targets.colors[i] ? targets.colors[i]->color_info_word : 0u);
++    if (same) {
++      out = m.a;
++      sasrt::gpu_round::Count(sasrt::gpu_round::kRt2SpecMemo);
++      // banjo_renut_fast_draw_verify: the kept answers against fresh ones (the pipeline check below uses these).
++      static const bool verify = REXCVAR_GET(banjo_renut_fast_draw_verify);
++      if (verify) [[unlikely]] {
++        const FetchSpec fetch = FetchSpecWords(sc, vs, per_instance, ab_off);
++        const u32 plain = SasrtPlainFetchMask(sc, ps_entry, vs.entry);
++        const u32 clip = SasrtClipBit(sc);
++        const SasrtSpecWords words = SasrtSpecWordsOf(sc, vs.entry, ps_entry, &vsc, &targets);
++        if (std::memcmp(&fetch, &out.fetch, sizeof(fetch)) != 0 || plain != out.plain || clip != out.clip ||
++            std::memcmp(&words, &out.words, sizeof(words)) != 0) {
++          static uint32_t logged = 0;
++          if (logged++ < 16)
++            RGPU_WARN("sasrt_rt2_spec_memo (banjo_renut_fast_draw_verify): the kept spec answers differ (fetch {} "
++                      "plain {:08X}/{:08X} clip {}/{} words {}; VS {:016X})",
++                      std::memcmp(&fetch, &out.fetch, sizeof(fetch)) != 0, out.plain, plain, out.clip, clip,
++                      std::memcmp(&words, &out.words, sizeof(words)) != 0, vs.hash);
++          out.fetch = fetch;
++          out.plain = plain;
++          out.clip = clip;
++          out.words = words;
++          m.a = out;
++          ++g_spec_memo_gen;
++        }
++      }
++      g_spec_memo_hit = true;
++      return;
++    }
++  }
++  out.fetch = FetchSpecWords(sc, vs, per_instance, ab_off);
++  out.plain = SasrtPlainFetchMask(sc, ps_entry, vs.entry);
++  out.clip = SasrtClipBit(sc);
++  out.words = SasrtSpecWordsOf(sc, vs.entry, ps_entry, &vsc, &targets);
++  if (memo) {
++    ++g_spec_memo_gen;
++    g_spec_memo_stored = true;
++    m.valid = true;
++    m.per_instance = per_instance;
++    m.ab = ab_off;
++    m.ab_now = ab_now;
++    m.vs = &vs;
++    m.vs_entry = vs.entry;
++    m.ps_entry = ps_entry;
++    m.sampler_gen = g_sasrt_sampler_generation;
++    m.color_count = targets.color_count;
++    for (u32 i = 0; i < 4; ++i) {
++      m.colors[i] = i < colors ? targets.colors[i] : nullptr;
++      m.color_info[i] = i < colors && targets.colors[i] ? targets.colors[i]->color_info_word : 0u;
++    }
++    m.a = out;
++    g_sc_dirty_seen = 0;
++    sasrt::gpu_round::Count(sasrt::gpu_round::kRt2SpecMemo, 1, 1);  // computed (the 10 s line's /n)
++  }
+ }
+ 
+ PipelineKey MakeKey(const GuestDevice &device, const ShaderRecord *vs, const ShaderRecord *ps,
+                     const VertexDeclarationRecord *declaration, const Targets &t, u32 primitive,
+@@ -9940,10 +11423,37 @@
+     return true;
+   }
+   if (!heap || address + len - 1 > 0xFFFFFFFFull)
+     return false;
+-  return uint32_t(heap->QueryRangeAccess(uint32_t(address), uint32_t(address + len - 1))) &
+-         uint32_t(rex::memory::PageAccess::kReadOnly);
++  // sasrt-nx (2026-11-20, sasrt_rt2_readable_memo; the second render-thread round's #29): ranges found readable, 64 of
++  // them by their first 64 KB, kept while no page anywhere has lost read access since (g_page_access_generation: each
++  // query takes the heap's recursive mutex, which the game's allocations hold too, and walks the page table). Two
++  // readable ranges that touch are one.
++  struct ReadableMemo {
++    const rex::memory::BaseHeap *heap = nullptr;
++    uint32_t lo = 0, hi = 0;
++    uint64_t generation = 0;
++  };
++  static ReadableMemo memo[64];
++  const uint32_t lo = uint32_t(address), hi = uint32_t(address + len - 1);
++  const bool memo_on = sasrt::gpu_round::On(sasrt::gpu_round::kRt2ReadableMemo);
++  const uint64_t generation = rex::memory::g_page_access_generation.load(std::memory_order_acquire);
++  ReadableMemo &m = memo[(lo >> 16) & 63u];
++  if (memo_on && m.heap == heap && m.generation == generation && m.lo <= lo && hi <= m.hi) {
++    sasrt::gpu_round::Count(sasrt::gpu_round::kRt2ReadableMemo);
++    return true;
++  }
++  const bool readable = uint32_t(heap->QueryRangeAccess(lo, hi)) & uint32_t(rex::memory::PageAccess::kReadOnly);
++  if (memo_on && readable) {
++    sasrt::gpu_round::Count(sasrt::gpu_round::kRt2ReadableMemo, 1, 1);  // queried (the 10 s line's /n)
++    if (m.heap == heap && m.generation == generation && lo <= uint64_t(m.hi) + 1 && uint64_t(hi) + 1 >= m.lo) {
++      m.lo = std::min(m.lo, lo);
++      m.hi = std::max(m.hi, hi);
++    } else {
++      m = {heap, lo, hi, generation};
++    }
++  }
++  return readable;
+ #endif
+ }
+ 
+ // dishonored-nx (2026-10-31; port 101): how many bytes from 'p' on are readable (whole 4 KB pages, as far as the first
+@@ -10609,8 +12117,12 @@
+   // banjo-nx (2026-10-27, render thread night): the draw's key where it is (a pipeline cache entry's, or 'key' for one
+   // made here: the full path's, a verify's): not copied out of the cache at every key change (about 200 bytes), and
+   // whether its blend controls read the blend constant (DrawBlendConstant's loop only when they do).
+   const PipelineKey *kp = nullptr;
++  // sasrt-nx (2026-11-20, sasrt_rt4_spec_key_skip): kp as last checked against the spec memo's answers of generation
++  // spec_ok_gen, with g_sasrt_key_writes then.
++  const PipelineKey *spec_ok_kp = nullptr;
++  uint64_t spec_ok_gen = 0, spec_ok_writes = 0;
+   KeyHot kp_hot;  // banjo-nx (2026-10-28): KeyHot::Of(*kp)
+   bool blend_used = true;
+   uint64_t key_rs_epoch = 0;  // the render-state epoch and the rest (FastDrawLocked's misc) the key was made for
+   u32 key_misc = ~0u;
+@@ -10670,14 +12182,37 @@
+     sig[1 + i] = u32(t.colors[i]->format);
+   sig[5] = t.depth ? u32(t.depth->format) : u32(plume::RenderFormat::UNKNOWN);
+   const HostSurface *first = t.color_count ? t.colors[0] : t.depth;
+   sig[6] = first ? u32(first->samples) : 0u;
+-  uint64_t h = 0x9E3779B97F4A7C15ull;
+-  for (u32 i = 0; i < 20; ++i)
+-    h = (h ^ rs[i]) * 0xFF51AFD7ED558CCDull;
+-  for (u32 i = 0; i < 7; ++i)
+-    h = (h ^ sig[i]) * 0xC4CEB9FE1A85EC53ull;
+-  RenderStateIdEntry &e = g_rs_ids[u32(h >> 56)];
++  u32 slot;
++#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
++  // sasrt-nx (2026-11-20, sasrt_rt4_state_id_crc; the third table's #25, the first's #42): the table's index from a
++  // CRC32C of the words, 8 bytes an instruction (14, 3 cycles each on the A57), not 27 dependent multiplies; a hit
++  // compares the words either way, so only the slots the states land in change.
++  if (sasrt::gpu_round::On(sasrt::gpu_round::kRt4StateIdCrc)) {
++    uint32_t c = 0xFFFFFFFFu;
++    for (u32 i = 0; i < 20; i += 2) {
++      uint64_t w;
++      std::memcpy(&w, rs + i, 8);
++      c = __builtin_aarch64_crc32cx(c, w);
++    }
++    for (u32 i = 0; i < 8; i += 2) {
++      uint64_t w;
++      std::memcpy(&w, sig + i, 8);
++      c = __builtin_aarch64_crc32cx(c, w);
++    }
++    slot = (c ^ (c >> 8) ^ (c >> 16) ^ (c >> 24)) & 0xFFu;
++  } else
++#endif
++  {
++    uint64_t h = 0x9E3779B97F4A7C15ull;
++    for (u32 i = 0; i < 20; ++i)
++      h = (h ^ rs[i]) * 0xFF51AFD7ED558CCDull;
++    for (u32 i = 0; i < 7; ++i)
++      h = (h ^ sig[i]) * 0xC4CEB9FE1A85EC53ull;
++    slot = u32(h >> 56);
++  }
++  RenderStateIdEntry &e = g_rs_ids[slot];
+   if (e.id && SameBytes<sizeof(e.rs)>(e.rs, rs) && SameBytes<sizeof(sig)>(e.targets, sig)) {
+     ++g_rs_id_hits;
+     return e.id;
+   }
+@@ -10725,9 +12260,14 @@
+ constexpr u32 kHostPacketBits = 13;  // 8,192 packets, direct-mapped (a city frame draws ~4,800 states)
+ HostPacket *g_host_packets = nullptr;
+ inline bool HostPacketsOn() {
+   static const bool on = REXCVAR_GET(banjo_renut_host_packets);
+-  return on;
++  // sasrt-nx (2026-11-20, sasrt_rt3_host_packets_split; the third render-thread round's #1): also while the screen is
++  // split (the composites' count of the frame before: g_sasrt_split_views), where the views replay the same state words
++  // (an in-run A/B of banjo_renut_host_packets in four players, run 317: about -4 % of the render thread at equal
++  // draws). One player keeps the key's own answer (off by default: neutral there).
++  return on || (g_sasrt_split_views.load(std::memory_order_relaxed) > 1 &&
++                sasrt::gpu_round::On(sasrt::gpu_round::kRt3HostPacketsSplit));
+ }
+ inline u32 HostPacketIndex(uint64_t key) { return u32((key * 0x9E3779B97F4A7C15ull) >> (64 - kHostPacketBits)); }
+ // The slot of a key (the table made at first use).
+ inline HostPacket &HostPacketSlot(uint64_t key) {
+@@ -10865,8 +12405,23 @@
+   ++g_fast_why[why];
+   return 0;
+ }
+ 
++// sasrt-nx (2026-11-20, sasrt_rt4_inert_keeps_chain; the third table's #28, the first's #15): a draw left out before the
++// fast path (sasrt_gpu_skip_inert_draws, sasrt_gpu_skip_cull_both: it writes nothing) keeps the chain: the fast state
++// takes its number and its changed fields are carried into the next draw's (the union of the two steps' changes covers
++// the change from the last drawn one). The 4P race left out ~240 draws a second, each a chain break for the next.
++u32 g_chain_carry_fields = 0;
++inline void SasrtKeepChainOverSkipped() {
++  FastState &f = g_fast;
++  const ChainHint &chain = g_chain_hint;
++  if (f.valid && chain.seq && chain.seq == f.seq + 1 && sasrt::gpu_round::On(sasrt::gpu_round::kRt4InertKeepsChain)) {
++    f.seq = chain.seq;
++    g_chain_carry_fields |= chain.fields;
++    sasrt::gpu_round::Count(sasrt::gpu_round::kRt4InertKeepsChain);
++  }
++}
++
+ }  // namespace
+ 
+ // banjo-nx (2026-10-26, the record-time draw path's round 3: the next draw's lookups ahead): the texture slots the
+ // last draw bound (most next draws bind the same ones), and a slot's memo entry fetched for the given texture and
+@@ -11012,8 +12567,31 @@
+   g_extent_answers = g_extent_fallbacks = g_extent_verified = g_extent_differ = 0;
+   return out;
+ }
+ 
++// sasrt-nx (2026-11-20, sasrt_rt4_export_reads_fast; the third table's #34, the first's #16): whether every vertex stream
++// of the draw that meets a pending memexport window is one the host layout reads and whose window FindExportedStream
++// finds on the GPU (DrawNeedsExportFlush's stream part: then no wait, ConvertExportedStreamsLocked converts it). A stream
++// read only by vfetchBound (no host input) is not: the fast path's fetch data does not take export windows.
++bool SasrtExportStreamsOnGpu(const GuestDevice &device, const DrawCall &call, const ShaderRecord &vs,
++                             const u32 *shader_strides, const VertexDeclarationRecord &declaration) {
++  for (u32 k = 0; k < declaration.stream_count; ++k) {
++    const u32 stream = declaration.stream_order[k];
++    if (stream == 0 && call.up_vertices)
++      continue;
++    const u32 fetch_index = d3d::kFirstVertexFetchIndex + d3d::StreamFetchIndex(stream);
++    if (!PendingExportSlotsMemo(kExportAnswerFetch + ((fetch_index - 64) & 31),
++                                device.VertexFetchWord(fetch_index, 0) & ~3u,
++                                device.VertexFetchWord(fetch_index, 1) & 0x3FFFFFCu))
++      continue;
++    ExportedStream exported;
++    if (!declaration.layout.streams[stream].used ||
++        !FindExportedStream(device, call, vs, shader_strides, declaration, stream, exported))
++      return false;
++  }
++  return true;
++}
++
+ bool FastExportReads(const GuestDevice &device, const DrawCall &call, const ShaderRecord &vs,
+                      const VertexDeclarationRecord &declaration, const TextureFetch *fetches, u32 texture_mask,
+                      bool streams, bool fetch, bool index, bool textures) {
+   const auto fetch_slots = [&device](u32 fetch_index) {
+@@ -11158,22 +12752,26 @@
+     return FastMiss(kFastNoState);
+   const ChainHint &chain = g_chain_hint;
+   if (!chain.seq || chain.seq != f.seq + 1)
+     return FastMiss(kFastBreak);
++  // sasrt-nx (2026-11-20, sasrt_rt4_inert_keeps_chain): the fields of draws left out since the last drawn one.
++  const u32 carried_fields = g_chain_carry_fields;
++  g_chain_carry_fields = 0;
+   // (Stage 2: Draw*UP, Begin*Vertices, range geometry and rectangle lists are the executor's too.)
+   // bangaio-nx (2026-10-29, banjo_renut_point_fast_draw / A/B 69): point lists too (their point state set below).
+   const bool point = call.primitive == kPointList;
+   if (call.tessellation || (point && !PointFastDrawOn()))
+     return FastMiss(kFastCall);
+-  const u32 fields = chain.fields | FastForceFields();  // culdcept-nx: banjo_renut_diag_fast_force
++  const u32 fields = chain.fields | carried_fields | FastForceFields();  // culdcept-nx: banjo_renut_diag_fast_force
+   // banjo-nx (2026-10-28, per-draw night): the predication is one of the viewport's inputs below (the viewport is all
+   // that reads it); A/B 61's off half sends the draw the full way as before.
+   if ((fields & kFieldPredication) && ab == 61)
+     return FastMiss(kFastFields);
+   // The targets gathered again (stage 2) when their words changed, a target was built, retired or rebound since
+   // (the surface epoch), or the draw before's depth target was left out (DropSmallerDepth, which reads the depth
+   // control) and the depth control may have changed.
+-  const bool targets_changed = (fields & kFieldTargets) || f.surface_epoch != SurfaceEpochLocked() ||
++  // sasrt-nx (2026-10-29): GatherTargets reads the destination packet too (each slot's EDRAM view).
++  const bool targets_changed = (fields & (kFieldTargets | kFieldDest)) || f.surface_epoch != SurfaceEpochLocked() ||
+                                (f.targets.depth_dropped && (fields & kFieldViewPackets));
+   if (cfg.draw_log || cfg.census || banjo::renut_gpu::ResolveTraceOn() || g_dump_fetch)
+     return FastMiss(kFastDiag);
+   const bool verify = cfg.verify;
+@@ -11483,18 +13128,46 @@
+     __builtin_prefetch(reinterpret_cast<const char *>(&c) + 64);
+   }
+   // Pending memexport results: the draw may read none of their windows (DrawNeedsExportFlush's "none, and no read met
+   // a window"), each kind of read kept while its inputs and the pending exports are the same (round 4).
+-  if ((check_streams || check_fetch || check_index || check_textures) &&
+-      FastExportReads(device, call, *vs, *declaration, fetches, texture_mask, check_streams, check_fetch, check_index,
+-                      check_textures))
+-    return FastMiss(kFastExportRead);
++  // sasrt-nx (2026-11-20, sasrt_rt4_export_reads_fast; the third table's #34): with the key, the stream reads asked
++  // apart: a draw whose only export reads are vertex streams the host layout reads from windows found on the GPU (the
++  // 4P race's "export read" draws, 93 a frame to the full path) has them converted here as DrawStateLocked does
++  // (ConvertExportedStreamsLocked before the streams are bound); not for whole-buffer geometry (WholeGeometryLocked
++  // took copies: the full path does not convert those either). Fetch, index and texture reads go the full way as before.
++  bool export_streams = false;
++  if (check_streams || check_fetch || check_index || check_textures) {
++    if (!sasrt::gpu_round::On(sasrt::gpu_round::kRt4ExportReadsFast)) {
++      if (FastExportReads(device, call, *vs, *declaration, fetches, texture_mask, check_streams, check_fetch,
++                          check_index, check_textures))
++        return FastMiss(kFastExportRead);
++    } else {
++      if ((check_fetch || check_index || check_textures) &&
++          FastExportReads(device, call, *vs, *declaration, fetches, texture_mask, false, check_fetch, check_index,
++                          check_textures))
++        return FastMiss(kFastExportRead);
++      if (check_streams &&
++          FastExportReads(device, call, *vs, *declaration, fetches, texture_mask, true, false, false, false)) {
++        if (whole || !SasrtExportStreamsOnGpu(device, call, *vs, shader_strides, *declaration))
++          return FastMiss(kFastExportRead);
++        export_streams = true;
++      }
++    }
++  }
+ #if defined(PLUME_DEKO3D)
+   if (!banjo::renut_gpu::PushConstantsOn() || !EnsurePushedBuffers())
+     return FastMiss(kFastPushed);
+ #else
+   return FastMiss(kFastPushed);
+ #endif
++  // sasrt-nx (2026-11-20, sasrt_rt4_export_reads_fast): the export windows' streams converted (their compute work and
++  // barriers recorded now; the bound pipeline and framebuffer are forgotten by it, so the binds below are made again).
++  GpuStreams export_gpu_streams;
++  if (export_streams) {
++    if (!ConvertExportedStreamsLocked(s, device, call, *vs, shader_strides, *declaration, geometry, export_gpu_streams))
++      return FastMiss(kFastExportRead);
++    sasrt::gpu_round::Count(sasrt::gpu_round::kRt4ExportReadsFast);
++  }
+   // From here the draw is the fast path's: the state below is this draw's.
+   ++g_trace_draws;
+   if (::renut::gpu::host_batch::CensusOn()) {  // blur-nx (2026-11-18, the census's #19): the draws with no field changed
+     ::renut::gpu::host_batch::Add(::renut::gpu::host_batch::kFastDraws);
+@@ -11889,77 +13605,36 @@
+                                                                   : RenderStateIdLocked(f.rs, targets);
+   const uint64_t prebuild_epoch = PrebuildEpochLocked();
+   const u32 misc = call.primitive | u32(geometry.per_instance) << 8 | alpha_test_func << 9 | u32(ab_off) << 16;
+   const ShaderCacheEntry *const ps_entry = ps ? ps->entry : nullptr;
+-  // banjo-nx (2026-11-21, A/B 172): the spec answers kept (SpecKeep) or made.
+-  SpecKeep &sk = g_spec_keep;
+-  const u32 sk_colors = std::min<u32>(targets.color_count, 4u);
+-  const bool sk_cacheable = !(vs->entry && vs->entry->memExportConstants[0]) && ab_off != 172;
+-  const bool sk_bound = DrawSummaryOf(*vs).bound_fetches;
+-  bool sk_hit = sk_cacheable && sk.valid && sk.bound_fetches == sk_bound &&
+-                sk.vs_entry == vs->entry && sk.ps_entry == ps_entry && sk.per_instance == geometry.per_instance &&
+-                sk.ab == ab_off && sk.color_count == targets.color_count;
+-  for (u32 i = 0; i < sk_colors && sk_hit; ++i)
+-    sk_hit = sk.color_info[i] == (targets.colors[i] ? targets.colors[i]->color_info_word : 0u);
+-  bool sk_by_words = false;
+-  if (sk_hit && (g_spec_lines_seen & kSpecLines) != 0) {
+-    sk_hit = sk_by_words = SpecInputsSame(sk, sc);  // a line they read was written: the words they read
+-    if (sk_hit)
+-      g_spec_lines_seen = 0;  // the words kept are the block's again
+-  }
+-  if (sk_hit && verify) [[unlikely]] {
+-    const FetchSpec vf = FetchSpecWords(sc, *vs, geometry.per_instance, ab_off);
+-    const SasrtSpecWords vw = SasrtSpecWordsOf(sc, vs->entry, ps_entry, &vs_constants, &targets);
+-    if (vf.kind != sk.fetch.kind || std::memcmp(vf.types, sk.fetch.types, sizeof(vf.types)) != 0 ||
+-        SasrtPlainFetchMask(sc, ps_entry, vs->entry) != sk.plain || SasrtClipBit(sc) != sk.clip ||
+-        std::memcmp(vw.w, sk.words.w, sizeof(vw.w)) != 0) {
+-      ++g_spec_verify_differ;
+-      static uint32_t logged = 0;
+-      if (logged++ < 16)
+-        RGPU_WARN("banjo_renut_fast_draw_verify: the kept spec answers differ from the draw's (made again)");
+-      sk_hit = false;
+-    }
+-  }
+-  if (sk_hit) {
+-    ++(sk_by_words ? g_spec_by_words : g_spec_kept);
+-  } else {
+-    ++g_spec_made;
+-    sk.fetch = FetchSpecWords(sc, *vs, geometry.per_instance, ab_off);  // banjo-nx (banjo_gpu_fetch_spec)
+-    sk.plain = SasrtPlainFetchMask(sc, ps_entry, vs->entry);  // sasrt-nx (2026-11-08); vivapinata-nx: vs
+-    sk.clip = SasrtClipBit(sc);  // sasrt-nx (2026-11-08, sasrt_gpu_clip_spec)
+-    sk.words = SasrtSpecWordsOf(sc, vs->entry, ps_entry, &vs_constants, &targets);  // sasrt-nx (third round)
+-    sk.valid = sk_cacheable;
+-    sk.bound_fetches = sk_bound;
+-    sk.vs_entry = vs->entry;
+-    sk.ps_entry = ps_entry;
+-    sk.per_instance = geometry.per_instance;
+-    sk.ab = ab_off;
+-    sk.color_count = targets.color_count;
+-    for (u32 i = 0; i < 4; ++i)
+-      sk.color_info[i] = i < sk_colors && targets.colors[i] ? targets.colors[i]->color_info_word : 0u;
+-    if (sk_cacheable) {
+-      sk.fetches = (ps_entry ? ps_entry->textureFetchMask : 0u) | (vs->entry ? vs->entry->textureFetchMask : 0u);
+-      sk.memory_fetches = vs->entry ? vs->entry->vertexFetchMemoryMask : 0u;
+-      SpecKeepInputs(sk, sc);
+-    }
+-    g_spec_lines_seen = 0;
+-  }
+-  const FetchSpec &fetch_spec = sk.fetch;
+   // banjo-nx (2026-10-27, shadow sort): the key reads the shaders through their cache entries and the declaration
+   // through its layout hash (MakeKey, BoolSpecMask), so another shader object of the same contents (N&B makes one per
+   // mesh: a new address at 69 % of the shadow draws) keeps the key and the pipeline; compared with the key's own.
+-  const u32 plain_fetches = sk.plain;  // sasrt-nx (2026-11-08); vivapinata-nx: vs (kept or made above)
+-  const u32 clip_bit = sk.clip;  // sasrt-nx (2026-11-08, sasrt_gpu_clip_spec)
+-  const SasrtSpecWords &spec_words = sk.words;  // sasrt-nx (third round)
++  // banjo_gpu_fetch_spec; sasrt-nx (2026-11-08) the plain fetches (vivapinata-nx: vs) and sasrt_gpu_clip_spec; the
++  // third round's words; sasrt-nx (2026-11-20, sasrt_rt2_spec_memo): the four kept from the draw before when unchanged.
++  SasrtSpecAnswers spec_answers;
++  SasrtSpecAnswersOf(sc, *vs, ps_entry, geometry.per_instance, ab_off, vs_constants, targets, spec_answers);
++  const FetchSpec &fetch_spec = spec_answers.fetch;
++  const u32 plain_fetches = spec_answers.plain;
++  const u32 clip_bit = spec_answers.clip;
++  const SasrtSpecWords &spec_words = spec_answers.words;
++  // sasrt-nx (2026-11-20, sasrt_rt4_spec_key_skip; the third table's #27): the spec answers are the memo's of the
++  // generation the kept key was last checked against, and no key was written since: its spec fields match them still.
++  const bool spec_known = g_spec_memo_hit && f.kp && f.kp == f.spec_ok_kp && f.spec_ok_gen == g_spec_memo_gen &&
++                          f.spec_ok_writes == g_sasrt_key_writes &&
++                          sasrt::gpu_round::On(sasrt::gpu_round::kRt4SpecKeySkip);
+   const bool key_inputs = f.key_rs_epoch != f.rs_epoch || !f.pipeline || !f.kp || depth_only != f.depth_only ||
+-                          !SameBytes<sizeof(spec_words.w)>(f.kp->sasrt_words, spec_words.w) ||  // sasrt-nx; inline
+                           misc != f.key_misc || f.prebuild_epoch != prebuild_epoch ||
+-                          f.kp->fetch_pad != (f.kp->pixel_shader ? plain_fetches : 0u) ||
+-                          (f.kp->reserved & 8u) != clip_bit ||  // sasrt-nx (2026-11-08, sasrt_gpu_clip_spec)
++                          (!spec_known &&
++                           (std::memcmp(f.kp->sasrt_words, spec_words.w, sizeof(spec_words.w)) != 0 ||  // sasrt-nx
++                            f.kp->fetch_pad != (f.kp->pixel_shader ? plain_fetches : 0u) ||
++                            (f.kp->reserved & 8u) != clip_bit ||  // sasrt-nx (2026-11-08, sasrt_gpu_clip_spec)
++                            FetchSpecDiffers(*f.kp, fetch_spec))) ||  // banjo_gpu_fetch_spec; vivapinata-nx: every draw
+                           ((shaders_changed || (fields & kFieldDecl)) &&
+                            (vs->entry != f.kp->vertex_shader || ps_entry != f.kp->pixel_shader ||
+-                            declaration->layout_hash != f.kp->layout_hash || ab_off == 41)) ||  // A/B 41: as before
+-                          FetchSpecDiffers(*f.kp, fetch_spec);  // banjo_gpu_fetch_spec; vivapinata-nx (2026-11-12): every draw
++                            declaration->layout_hash != f.kp->layout_hash || ab_off == 41));  // A/B 41: as before
++  if (spec_known)
++    sasrt::gpu_round::Count(sasrt::gpu_round::kRt4SpecKeySkip);
+   if (key_inputs) {
+     // blur-nx (2026-11-18, the Renut host batch's #16, blur_renut_fast_pipeline_two_way / A/B 235): the entry and its
+     // neighbour. An entry answers when it was made from this draw's inputs (same_inputs: all that MakeKey reads and the
+     // words set after it) in this generation and prebuild epoch (or not provisional); a miss fills the way with this
+@@ -11980,9 +13655,39 @@
+              e.generation == g_fast_pipeline_generation;
+     };
+     FastPipeline *cp = &g_fast_pipelines[fp_index];
+     bool hit = answers(*cp);
+-    if (!hit && ::renut::gpu::host_batch::On(::renut::gpu::host_batch::kPipelineTwoWay)) {
++    // sasrt-nx (2026-11-20, sasrt_rt4_pipeline_four_way; the third table's #24, the first's #17): the four entries of the
++    // index's aligned group (the 4P race: 4,516 conflicts a 10 s with two ways, each a MakeKey and GetPipelineLocked).
++    // The same choice as two ways: an entry that answers; else one made from this draw's inputs, else an empty one, else
++    // the one used longest ago.
++    if (!hit && ::renut::gpu::host_batch::On(::renut::gpu::host_batch::kPipelineTwoWay) &&
++        sasrt::gpu_round::On(sasrt::gpu_round::kRt4PipelineFourWay)) {
++      FastPipeline *victim = nullptr;
++      int victim_rank = -1;  // 3: same inputs, 2: empty, 1: older (by age)
++      uint32_t victim_age = 0;
++      for (u32 w = 0; w < 4; ++w) {
++        FastPipeline &e = g_fast_pipelines[(fp_index & ~3u) | w];
++        if (answers(e)) {
++          cp = &e;
++          hit = true;
++          break;
++        }
++        const int rank = same_inputs(e) ? 3 : !e.pipeline ? 2 : 1;
++        const uint32_t age = uint8_t(g_fast_pipeline_stamp - e.stamp);
++        if (rank > victim_rank || (rank == victim_rank && rank == 1 && age > victim_age)) {
++          victim = &e;
++          victim_rank = rank;
++          victim_age = age;
++        }
++      }
++      if (!hit) {
++        cp = victim;
++        sasrt::gpu_round::Count(sasrt::gpu_round::kRt4PipelineFourWay, 1, 1);  // a miss (the line's /n)
++      } else {
++        sasrt::gpu_round::Count(sasrt::gpu_round::kRt4PipelineFourWay);
++      }
++    } else if (!hit && ::renut::gpu::host_batch::On(::renut::gpu::host_batch::kPipelineTwoWay)) {
+       FastPipeline &other = g_fast_pipelines[fp_index ^ 1u];
+       if (answers(other)) {
+         cp = &other;
+         hit = true;
+@@ -12013,8 +13718,9 @@
+       // would make again: looked up again with it.
+       const bool keep_key = c.generation == g_fast_pipeline_generation && same_inputs(c) &&
+                             ::renut::gpu::host_batch::On(::renut::gpu::host_batch::kProvisionalKey);
+       if (!keep_key) {
++        ++g_sasrt_key_writes;  // sasrt-nx (2026-11-20, sasrt_rt4_spec_key_skip)
+         c.key = MakeKey(device, vs, ps, declaration, targets, call.primitive, geometry.per_instance, sc.booleans,
+                         sc.alpha_test_func, fetch_spec);
+         c.key.fetch_pad = c.key.pixel_shader ? plain_fetches : 0u;  // sasrt-nx (2026-11-08, sasrt_gpu_plain_fetches)
+         c.key.reserved = (c.key.reserved & ~8u) | clip_bit;  // sasrt-nx (2026-11-08, sasrt_gpu_clip_spec)
+@@ -12051,14 +13757,24 @@
+       static uint32_t logged = 0;
+       if (logged++ < 8)
+         RGPU_WARN("banjo_renut_fast_draw_verify: the kept or cached pipeline {} differs from the one made (VS {:016X})",
+                   std::memcmp(&key, f.kp, sizeof(key)) != 0 ? "key" : "", vs->hash);
++      ++g_sasrt_key_writes;  // sasrt-nx (2026-11-20, sasrt_rt4_spec_key_skip)
+       f.key = key;
+       f.kp = &f.key;
+       f.kp_hot = KeyHot::Of(key);
+       f.blend_used = true;
+       f.pipeline = made;
+     }
++  }
++  // sasrt-nx (2026-11-20, sasrt_rt4_spec_key_skip): the kept key now matches this draw's spec answers (compared, or
++  // found or made with them); known for the next draw when they are the memo's.
++  if (g_spec_memo_hit || g_spec_memo_stored) {
++    f.spec_ok_kp = f.kp;
++    f.spec_ok_gen = g_spec_memo_gen;
++    f.spec_ok_writes = g_sasrt_key_writes;
++  } else {
++    f.spec_ok_kp = nullptr;
+   }
+   plume::RenderPipeline *pipeline = f.pipeline;
+   if (!pipeline)
+     return -1;
+@@ -12075,14 +13791,43 @@
+   // that writes its depth or stencil (BindTargets then draws the resolve first).
+   const u32 fast_dc = f.kp_hot.depth_control;
+   const bool fast_depth_writes = ((fast_dc & 2) && (fast_dc & 4)) ||
+                                  ((fast_dc & 1) && ((f.kp_hot.stencil_ref_mask >> 16) & 0xFF) != 0);
++  if (sasrt::gpu_round::On(sasrt::gpu_round::kCutTakeOnOverwrite)) [[unlikely]] {  // sasrt-nx (2026-11-09): a cut
++    for (u32 i = 0; i < targets.color_count; ++i)
++      if (targets.colors[i]->handed)
++        return FastMiss(kFastSurfaces);
++  }
+   // Port 179 (from fnxf_xiii; banjo_renut_edram_carry, off): before the bind test, so every draw marks its targets this
+   // frame; a carry draws with its own framebuffer and resets g_bound, so the targets are bound again below.
+   if (EdramCarryOn()) [[unlikely]]
+     CarryEdramBeforeDrawLocked(targets);
++  // sasrt-nx (2026-11-20, sasrt_rt2_bind_layout_narrow; the second render-thread round's #14): a layout change somewhere
++  // since the last bind (g_layout_epoch moves at every transition: a texture made readable, any target) binds the targets
++  // again only when this draw's own targets are not all in the layouts BindTargets would leave them in, or hold
++  // something BindTargets does first (a pending restore copy, a hand-over); else nothing it does would change anything.
++  const auto layouts_hold = [&] {
++    if (!sasrt::gpu_round::On(sasrt::gpu_round::kRt2BindLayoutNarrow) || gpu_profile::Timed())
++      return false;
++    for (u32 i = 0; i < targets.color_count; ++i) {
++      const HostSurface *c = targets.colors[i];
++      if (c->layout != plume::RenderTextureLayout::COLOR_WRITE || c->handed || c->sasrt_copy_pending)
++        return false;
++    }
++    if (const HostSurface *d = targets.depth) {
++      if (d->handed)
++        return false;
++      if (d->layout != plume::RenderTextureLayout::DEPTH_WRITE &&
++          (fast_depth_writes || d->layout != plume::RenderTextureLayout::SHADER_READ ||
++           !banjo::renut_gpu::DepthReadLayoutOn()))
++        return false;
++    }
++    sasrt::gpu_round::Count(sasrt::gpu_round::kRt2BindLayoutNarrow);
++    f.bind_layout_epoch = g_layout_epoch;
++    return true;
++  };
+   if (targets_changed || !g_bound.framebuffer || g_bound.framebuffer != f.bound_framebuffer ||
+-      f.bind_layout_epoch != g_layout_epoch || f.framebuffer_epoch != FramebufferEpochLocked() ||
++      (f.bind_layout_epoch != g_layout_epoch && !layouts_hold()) || f.framebuffer_epoch != FramebufferEpochLocked() ||
+       (targets.depth && targets.depth->handed && (fast_depth_writes || !banjo::renut_gpu::DepthHandOverReadOnlyOn())) ||
+       // kameo-nx (2026-11-03, banjo_deko3d_depth_read_layout): a draw that writes a depth target left in the read layout.
+       (fast_depth_writes && targets.depth && targets.depth->layout != plume::RenderTextureLayout::DEPTH_WRITE) ||
+       (gpu_profile::Timed() && !banjo::renut_gpu::DiagGpuShadersOn())) {
+@@ -12123,9 +13868,17 @@
+       cmd->setPipeline(pipeline);
+     }
+     g_bound.pipeline = pipeline;
+   }
+-  SetDrawDepthBias(cmd, dev);  // rr6-nx (2026-11-03, rr6_depth_bias)
++  // rr6-nx (2026-11-03, rr6_depth_bias). sasrt-nx (2026-11-20, sasrt_rt3_depth_bias_fields; the third render-thread
++  // round's #31): not called when the bias set is still bound and none of the packets it reads changed since the draw
++  // before in the chain (its mode control in the view packets, its words in the point packet, kFieldMisc, the depth
++  // info in the destination packet): it would read three cold lines of the snapshot to set what is set.
++  if (!(g_bound.depth_bias_set && !(fields & (kFieldDest | kFieldViewPackets | kFieldMisc)) &&
++        sasrt::gpu_round::On(sasrt::gpu_round::kRt3DepthBiasFields)))
++    SetDrawDepthBias(cmd, dev);
++  else
++    sasrt::gpu_round::Count(sasrt::gpu_round::kRt3DepthBiasFields);
+   float blend_constant[4];
+   if (f.blend_used && DrawBlendConstant(dev, *f.kp, blend_constant) &&
+       !(g_bound.blend_constant_set && SameBytes<sizeof(blend_constant)>(blend_constant, g_bound.blend_constant))) {
+     if (SetBlendConstant(cmd, blend_constant)) {
+@@ -12295,8 +14066,9 @@
+   f.fetch_kept = false;  // banjo-nx (2026-10-27): DrawStateLocked bound its own
+   g_last_draw_kind = DrawKindOf(targets, depth_only ? nullptr : device_ps);  // banjo-nx (2026-10-27): the census's
+   g_last_draw_fields = g_chain_hint.fields;
+   g_last_draw_fast = false;
++  g_chain_carry_fields = 0;  // sasrt-nx (2026-11-20, sasrt_rt4_inert_keeps_chain): a new chain from this draw
+   f.valid = usable;
+   if (!usable)
+     return;
+   f.seq = g_chain_hint.seq;
+@@ -12328,8 +14100,9 @@
+   f.alpha_test_func = alpha_test_func;
+   f.textures_valid = false;  // the next draw fills its slots (the words and transitions are DrawStateLocked's)
+   f.texture_mask = texture_mask;
+   (void)fetches;
++  ++g_sasrt_key_writes;  // sasrt-nx (2026-11-20, sasrt_rt4_spec_key_skip)
+   f.key = key;
+   f.kp = &f.key;  // banjo-nx (2026-10-27)
+   f.kp_hot = KeyHot::Of(key);  // banjo-nx (2026-10-28)
+   f.blend_used = true;
+@@ -12983,40 +15184,132 @@
+   g_ds_keys_ready = true;
+ }
+ }  // namespace
+ 
++namespace {
++void SasrtViewDumpMidLocked();  // sasrt-nx (2026-11-21, sasrt_renut_diag_view_dump): defined below (anonymous namespace)
++}  // namespace
++void SasrtViewDumpMidHook() { SasrtViewDumpMidLocked(); }  // Video::NoteFrameDrawLocked, while g_sasrt_view_dump_pending
++
++// sasrt-nx (2026-11-21, sasrt_resolve_remake_carry; render/textures.cpp ResolveTarget): 'from''s image drawn into 'to'
++// (the same format and guest size, another scale): present_vs's triangle over 'to', ui_upscale_ps reading 'from''s raw
++// view (no swizzle) with the point sampler at the same guest coordinates, every texel written.
++bool SasrtCarryResolveContentLocked(HostTexture *from, HostTexture *to) {
++  auto &s = State();
++  plume::RenderCommandList *cmd = s.command_list;
++  if (!cmd || !from || !to || !from->texture || !to->texture || !s.present_vs || !s.utility_layout)
++    return false;
++  const uint32_t source_slot = RawViewSlotLocked(*from);
++  if (source_slot == kInvalidDescriptor)
++    return false;
++  static std::unique_ptr<plume::RenderShader> ps;
++  static bool tried = false;
++  if (!tried) {
++    tried = true;
++    ps = CreateHostShader(s.device.get(), RENUT_HOST_SHADER(ui_upscale_ps), "ui_upscale_ps");
++  }
++  if (!ps)
++    return false;
++  struct Entry {
++    plume::RenderFormat format = plume::RenderFormat::UNKNOWN;
++    std::unique_ptr<plume::RenderPipeline> pipeline;
++  };
++  static Entry entries[12];
++  plume::RenderPipeline *pipeline = nullptr;
++  for (Entry &e : entries) {
++    if (e.pipeline && e.format == to->host_format) {
++      pipeline = e.pipeline.get();
++      break;
++    }
++    if (e.pipeline)
++      continue;
++    plume::RenderGraphicsPipelineDesc desc;
++    desc.pipelineLayout = s.utility_layout.get();
++    desc.vertexShader = s.present_vs.get();
++    desc.pixelShader = ps.get();
++    desc.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
++    desc.cullMode = plume::RenderCullMode::NONE;
++    desc.renderTargetCount = 1;
++    desc.renderTargetFormat[0] = to->host_format;
++    desc.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
++    e.pipeline = s.device->createGraphicsPipeline(desc);
++    e.format = to->host_format;
++    if (e.pipeline)
++      e.pipeline->setName("sasrt resolve carry");
++    pipeline = e.pipeline.get();
++    break;
++  }
++  if (!pipeline)
++    return false;
++  if (!to->copy_framebuffer) {
++    const plume::RenderTexture *targets[] = {to->texture.get()};
++    to->copy_framebuffer = s.device->createFramebuffer(plume::RenderFramebufferDesc(targets, 1));
++    if (!to->copy_framebuffer)
++      return false;
++  }
++  TransitionTextureLocked(from, plume::RenderTextureLayout::SHADER_READ);
++  TransitionTextureLocked(to, plume::RenderTextureLayout::COLOR_WRITE);
++  cmd->setFramebuffer(to->copy_framebuffer.get());
++  cmd->setViewports(plume::RenderViewport(0.0f, 0.0f, float(to->alloc_width), float(to->alloc_height)));
++  cmd->setScissors(plume::RenderRect(0, 0, int32_t(to->alloc_width), int32_t(to->alloc_height)));
++  cmd->setGraphicsPipelineLayout(s.utility_layout.get());
++  cmd->setPipeline(pipeline);
++  cmd->setGraphicsDescriptorSet(s.texture_set.get(), 0);
++  cmd->setGraphicsDescriptorSet(s.sampler_set.get(), 1);
++  UtilityPush push{};
++  push.scale[0] = push.scale[1] = 1.0f;
++  push.texture_index = source_slot;
++  push.sampler_index = kPointClampSamplerSlot;
++  cmd->setGraphicsPushConstants(0, &push, 0, sizeof(push));
++  cmd->drawInstanced(3, 1, 0, 0);
++  TransitionTextureLocked(to, plume::RenderTextureLayout::SHADER_READ);
++  // The draw path binds its own layout, pipeline, targets and viewport again.
++  g_bound.framebuffer = nullptr;
++  g_bound.pipeline = nullptr;
++  g_bound.layout = false;
++  g_bound.viewport_set = false;
++  return true;
++}
+ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayConstants *replay) {
+   ::renut::gpu::census::Scope census_scope(::renut::gpu::census::kDrawState);  // blur-nx (2026-11-17)
+   if (!g_ds_keys_ready) [[unlikely]]  // blur-nx (2026-11-17, audit #24)
+     ReadDrawStateKeys();
+-  {  // sasrt-nx (2026-11-11, port 82; its GPU list's row 4; UNTESTED), sasrt_gpu_skip_cull_both: before everything else
++  {  // sasrt-nx (2026-11-11, sasrt_gpu_skip_cull_both)
+     const bool cull_both = g_ds_keys.cull_both;
+-    if (cull_both && SasrtCullBothLocked(device_state, call)) [[unlikely]]
++    if (cull_both && SasrtCullBothLocked(device_state, call)) [[unlikely]] {
++      SasrtKeepChainOverSkipped();  // sasrt-nx (2026-11-20, sasrt_rt4_inert_keeps_chain)
+       return true;
++    }
+   }
+   // sasrt-nx (2026-11-08, sasrt_gpu_skip_inert_draws): before the fast path and the targets (SasrtInertDrawLocked). The
+   // chain's next draw then finds no kept state of this one (its sequence number is not the last kept + 1): the full path.
+   if (sasrt::gpu_round::On(sasrt::gpu_round::kInertDraws)) {
+     const GuestDevice inert_device(device_state);
+     const u32 dc = inert_device.valid() ? u32(inert_device.dev().m_ControlPacket.DepthControl) : 6u;
+     if ((dc & 6) != 6 && SasrtInertDrawLocked(device_state)) [[unlikely]] {
+       sasrt::gpu_round::Count(sasrt::gpu_round::kInertDraws);
++      SasrtKeepChainOverSkipped();  // sasrt-nx (2026-11-20, sasrt_rt4_inert_keeps_chain)
+       return true;
+     }
+   }
+   static const size_t split_chunks = [] {
+     const int mb = banjo::renut_gpu::SplitFrameMb();
+     return mb > 0 && IsDeko3D() ? std::max<size_t>(size_t(mb) / 16, 1) : ~size_t(0);
+   }();
+-  // sasrt-nx (2026-11-09 night, sasrt_memory_governor; port 58): at 48 MB (3 chunks) while memory is low (SASRT's
+-  // load frames grew the rings to 160-240 MB in its docked crashes); a frame split is submitted, the same pixels.
+-  if (const size_t chunk = Video::UploadsLocked().CurrentChunk();
+-      chunk >= split_chunks || (chunk >= 3 && split_chunks != ~size_t(0) && banjo::renut_gpu::MemoryLow())) [[unlikely]]
+-    SplitLongFrameLocked();  // kameo-nx (2026-11-04)
++  if (Video::UploadsLocked().CurrentChunk() >= split_chunks) [[unlikely]]  // kameo-nx (2026-11-04)
++    SplitLongFrameLocked();
++  // sasrt-nx (2026-11-11, sasrt_renut_split_draws; video.cpp): the list ends here after N draws, as at a kick.
++  if (Video::DrawSplitDueLocked()) [[unlikely]] {
++    FlushVertexFillsLocked();
++    FlushTextureFillsLocked();
++    Video::KickLocked();
++  }
++  Video::NoteFrameDrawLocked();  // sasrt-nx (2026-11-11, sasrt_renut_diag_flash_watch): every draw the frame is handed
+   // banjo-nx (2026-10-26, the record-time draw path): the lean executor first; 0: this draw is DrawStateLocked's.
+   if (const int fast = FastDrawLocked(device_state, call, replay))
+     return fast > 0;
+   ++g_trace_draws;
++  ++g_sasrt_take_cover_draw;  // sasrt-nx (2026-11-09, sasrt_gpu_diag_take_cover)
+   auto &s = State();
+   const GuestDevice device(device_state);
+   if (!device.valid())
+     return false;
+@@ -14874,8 +17537,15 @@
+   const bool over_limit = g_stream_cache_bytes > banjo::renut_gpu::StreamCacheMaxBytes(kStreamCacheMaxBytes);
+   if (!over_limit && g_stream_cache_frame % kWholeReplacePeriod &&
+       banjo::renut_gpu::g_ab_off_plain != 54)
+     return;  // banjo-nx (2026-10-28): kWholeReplacePeriod (A/B 54: every frame, as before)
++  // sasrt-nx (2026-11-20, sasrt_rt2_drop_throttle): over the limit, every 4th frame (the 4-player race sat over it).
++  if (over_limit && g_stream_cache_frame % 4u != 0 && sasrt::gpu_round::On(sasrt::gpu_round::kRt2DropThrottle)) {
++    sasrt::gpu_round::Count(sasrt::gpu_round::kRt2DropThrottle);
++    return;
++  }
++  if (over_limit)
++    sasrt::gpu_round::Count(sasrt::gpu_round::kRt2DropThrottle, 1, 1);  // passes over the limit (the line's /n)
+   const auto ready = std::find_if(g_whole_spans.begin(), g_whole_spans.end(), [](const WholeSpan &w) {
+     return g_stream_cache_frame - w.frame < kWholeReplaceFrames;
+   });
+   std::vector<WholeSpan> spans(g_whole_spans.begin(), ready);
+@@ -15067,15 +17745,23 @@
+ 
+   DropReplacedRanges();
+   // sasrt-nx (2026-10-21, sasrt_renut_exports_held): kept exports four frames old go (a game exporting its skinned meshes every
+   // frame, in two buffers by turns).
++  bool held_dropped = false;  // sasrt-nx (2026-11-20, sasrt_rt2_held_export_bitmap)
+   for (auto it = g_held_exports.begin(); it != g_held_exports.end();) {
+     if (g_stream_cache_frame - it->second.frame > 4) {
+       g_held_retired.push_back(std::move(it->second.data));
+       it = g_held_exports.erase(it);
++      held_dropped = true;
+     } else {
+       ++it;
+     }
++  }
++  if (held_dropped) {  // the granules made again from what is kept (a few hundred entries, once a frame)
++    std::fill(std::begin(g_held_granules), std::end(g_held_granules), 0ull);
++    for (const auto &[base, h] : g_held_exports)
++      if (h.data && !h.data->empty())
++        HeldGranulesMark(base, u32(h.data->size()));
+   }
+   if (g_held_reads && banjo::renut_gpu::ExportsHeldOn() && g_stream_cache_frame % 300 == 0) {
+     RGPU_INFO("[renut] vertex streams read from kept export results (sasrt_renut_exports_held): {} in 300 frames; {} kept",
+               g_held_reads, g_held_exports.size());
+--- base/app/src/renut_engine/gpu/render/textures.cpp
++++ sasrt-nx/app/src/renut_engine/gpu/render/textures.cpp
+@@ -1733,8 +1973,147 @@
+     ReadLevelParallel(f.info, f.fetch, f.src, f.blocks_w, f.blocks_h, f.depth, f.dst, f.row_pitch,
+                       f.slice_pitch);  // port 171
+   }
+   g_pending_fills.clear();
++}
++
++HostTexture *FindHostTextureByVaLocked(u32 texture_va) {
++  const auto it = g_textures.find(texture_va);
++  return it != g_textures.end() ? it->second.get() : nullptr;
++}
++
++// sasrt-nx (2026-11-12, batch D1): the scan's test of one texture (what it returns for it, or nullptr).
++static HostTexture *SasrtSlotOwner(HostTexture *t, uint32_t slot) {
++  if (t->slot == slot || t->level0_slot == slot)
++    return t;
++  for (const auto &v : t->swizzle_views)
++    if (v.slot == slot)
++      return t;
++  if (t->words && t->words->slot == slot)
++    return t->words.get();
++  for (const auto &v : t->words_views)
++    if (v.slot == slot)
++      return t->words.get() ? t->words.get() : t;
++  return nullptr;
++}
++REXCVAR_DEFINE_BOOL(sasrt_texture_slot_memo, true, "SASRT/GPU",
++                    "FindHostTextureBySlotLocked remembers its last answer (slot -> texture), checked by the same "
++                    "fields the scan tests, instead of walking every texture each call")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++HostTexture *FindHostTextureBySlotLocked(uint32_t slot) {
++  // sasrt-nx (2026-11-12, batch D1): a slot has one live owner (AllocateTextureSlotLocked; Retire frees them), so the
++  // remembered texture, if it still holds the slot, is the one the scan finds.
++  static const bool memo_on = REXCVAR_GET(sasrt_texture_slot_memo);
++  static uint32_t memo_slot = UINT32_MAX, memo_va = 0;
++  // sasrt-nx (2026-11-20, sasrt_rt2_slot_index): an answer per slot (256 sets by the slot's low bits), checked the same
++  // way: the post passes' copy-back checks ask for a dozen slots in turn, which one entry kept missing.
++  struct SlotMemo {
++    uint32_t slot = UINT32_MAX, va = 0;
++  };
++  static SlotMemo memo_table[256];
++  const bool table_on = memo_on && sasrt::gpu_round::On(sasrt::gpu_round::kRt2SlotIndex);
++  if (table_on && slot != UINT32_MAX) {
++    SlotMemo &m = memo_table[slot & 255u];
++    if (m.slot == slot) {
++      const auto it = g_textures.find(m.va);
++      if (it != g_textures.end() && it->second)
++        if (HostTexture *r = SasrtSlotOwner(it->second.get(), slot)) {
++          sasrt::gpu_round::Count(sasrt::gpu_round::kRt2SlotIndex);
++          return r;
++        }
++    }
++  } else if (memo_on && slot == memo_slot && slot != UINT32_MAX) {
++    const auto it = g_textures.find(memo_va);
++    if (it != g_textures.end() && it->second)
++      if (HostTexture *r = SasrtSlotOwner(it->second.get(), slot))
++        return r;
++  }
++  for (const auto &[va, owned] : g_textures) {
++    HostTexture *t = owned.get();
++    if (!t)
++      continue;
++    if (HostTexture *r = SasrtSlotOwner(t, slot)) {
++      memo_slot = slot;
++      memo_va = va;
++      if (table_on)
++        memo_table[slot & 255u] = {slot, va};
++      sasrt::gpu_round::Count(sasrt::gpu_round::kRt2SlotIndex, 1, 1);  // the walks (the 10 s line's /n)
++      return r;
++    }
++  }
++  return nullptr;
++}
++
++uint64_t g_sasrt_sampler_generation = 0;  // sasrt-nx (2026-11-09, the cuts 56-57): see textures.h
++uint64_t g_sasrt_sampler_point[64] = {};  // sasrt-nx (2026-11-09, sasrt_gpu_cut_gather_pcf): see textures.h
++
++HostTexture *SasrtWordsViewOwnerLocked(uint32_t slot) {
++  // sasrt-nx (2026-11-09, sasrt_rt_words_owner_memo; the render-thread round): the last answer, checked.
++  static uint32_t memo_slot = UINT32_MAX, memo_va = 0;
++  const bool memo = sasrt::gpu_round::On(sasrt::gpu_round::kRtWordsOwnerMemo);
++  // sasrt-nx (2026-11-20, sasrt_rt3_words_owner_table; the third render-thread round's #4): an answer per slot (256 sets
++  // by its low bits), each checked as before: the views' restore copies (two a view a frame, four views) took turns on
++  // the one entry, and each miss walked every texture (SasrtRestoreCopyLocked 1.2 % of the render thread, 4 players).
++  struct OwnerMemo {
++    uint32_t slot = UINT32_MAX, va = 0;
++  };
++  static OwnerMemo table[256];
++  const bool table_on = memo && sasrt::gpu_round::On(sasrt::gpu_round::kRt3WordsOwnerTable);
++  if (table_on && table[slot & 255u].slot == slot) {
++    if (HostTexture *t = FindHostTextureLocked(table[slot & 255u].va); t && t->words)
++      for (const auto &v : t->words_views)
++        if (v.slot == slot) {
++          sasrt::gpu_round::Count(sasrt::gpu_round::kRt3WordsOwnerTable);
++          return t;
++        }
++  } else if (memo && slot == memo_slot) {
++    if (HostTexture *t = FindHostTextureLocked(memo_va); t && t->words)
++      for (const auto &v : t->words_views)
++        if (v.slot == slot) {
++          sasrt::gpu_round::Count(sasrt::gpu_round::kRtWordsOwnerMemo);
++          return t;
++        }
++  }
++  for (const auto &[va, owned] : g_textures) {
++    HostTexture *t = owned.get();
++    if (!t || !t->words)
++      continue;
++    for (const auto &v : t->words_views)
++      if (v.slot == slot) {
++        if (memo) {
++          memo_slot = slot;
++          memo_va = va;
++          sasrt::gpu_round::Count(sasrt::gpu_round::kRtWordsOwnerMemo, 1, 1);
++        }
++        if (table_on)
++          table[slot & 255u] = {slot, va};
++        return t;
++      }
++  }
++  return nullptr;
++}
++
++uint32_t SasrtFloatSlotLocked(HostTexture &t) {
++  if (!t.texture || t.host_format != plume::RenderFormat::R32_FLOAT)
++    return UINT32_MAX;
++  if (t.sasrt_float_view && t.sasrt_float_of == t.texture.get())
++    return t.sasrt_float_slot;
++  if (t.sasrt_float_view)
++    Video::RetireLocked(std::move(t.sasrt_float_view));
++  if (t.sasrt_float_slot == UINT32_MAX) {
++    t.sasrt_float_slot = Video::AllocateTextureSlotLocked();
++    if (t.sasrt_float_slot == kInvalidDescriptor) {
++      t.sasrt_float_slot = UINT32_MAX;
++      return UINT32_MAX;
++    }
++  }
++  t.sasrt_float_view = t.texture->createTextureView(plume::RenderTextureViewDesc::Texture2D(plume::RenderFormat::R32_FLOAT));
++  if (!t.sasrt_float_view)
++    return UINT32_MAX;
++  t.sasrt_float_of = t.texture.get();
++  Video::SetTextureSlotLocked(t.sasrt_float_slot, t.texture.get(), t.sasrt_float_view.get());
++  return t.sasrt_float_slot;
+ }
+ 
+ HostTexture *FindHostTextureLocked(u32 texture_va) {
+   auto it = g_textures.find(texture_va);
+--- base/app/src/renut_engine/gpu/render/surfaces.cpp
++++ sasrt-nx/app/src/renut_engine/gpu/render/surfaces.cpp
+@@ -213,11 +227,20 @@
+   // path's TargetKey keys on ColorInfo.
+   u32 va = 0, size = 0, info = 0, format = 0, color_info = 0;
+   uint64_t epoch = 0;
+   HostSurface *surface = nullptr;
++  // sasrt-nx (2026-11-09, sasrt_rt_view_surface_memo): color_info above (port 161's) is a view entry's colour info too.
++  bool view = false;   // sasrt-nx: an entry a view lookup made (answers only those)
+ };
+-SurfaceMemo g_surface_memo[64];  // banjo-nx (2026-10-19, render-thread proposal 8): 64, indexed by a hash of the VA
++// banjo-nx (2026-10-19, render-thread proposal 8): 64, indexed by a hash of the VA. sasrt-nx (2026-11-20,
++// sasrt_rt3_surface_memo_256; the third render-thread round's #24): 256 (the four views' targets and resolves, their
++// EDRAM views and the stack headers conflicted in 64); the first 64 alone with the key off.
++SurfaceMemo g_surface_memo[256];
+ uint64_t g_surface_epoch = 1;
++// sasrt-nx (2026-11-12, batch C5, sasrt_surface_override_lazy_clear): a replayed draw's override clear not applied yet
++// (SetReplaySurfaceOverridesLocked); whatever reads the overrides or the epoch applies it first (SettleOverridesSlow).
++bool g_override_owed = false;
++void SettleOverridesSlow();
+ 
+ void FreeDepthViews(std::vector<DepthImage::View> &views) {
+   for (DepthImage::View &v : views) {
+     if (v.slot != UINT32_MAX && v.slot != kInvalidDescriptor)
+@@ -1062,16 +1181,58 @@
+   if (key == g_surface_keys.end())
+     return nullptr;
+   auto it = g_targets.find(key->second);
+   if (it != g_targets.end() && it->second)
+-    it->second->sasrt_used_frame = g_sasrt_frames;  // sasrt-nx (2026-11-09, sasrt_retire_idle_targets_frames; port 58)
++    it->second->sasrt_used_frame = g_sasrt_frames;  // sasrt-nx (2026-11-09, sasrt_retire_idle_targets_frames)
+   return it != g_targets.end() ? it->second.get() : nullptr;
++}
++
++void EdramAliasesLocked(const HostSurface *surface, std::vector<HostSurface *> &out) {
++  out.clear();
++  if (!surface)
++    return;
++  uint64_t own = 0;
++  bool found = false;
++  for (const auto &[key, target] : g_targets) {
++    if (target.get() == surface) {
++      own = key;
++      found = true;
++      break;
++    }
++  }
++  if (!found)
++    return;
++  for (const auto &[key, target] : g_targets) {
++    if (target && target.get() != surface && target->texture && target->depth == surface->depth &&
++        (key & 0xFFF) == (own & 0xFFF))
++      out.push_back(target.get());
++  }
+ }
+ 
+ void ColorAliasesLocked(const HostSurface *surface, std::vector<HostSurface *> &out) {
+   out.clear();
+   if (!surface || surface->depth)
+     return;
++  // sasrt-nx (2026-11-20, sasrt_rt2_color_alias_memo): what the scans found, kept until the table changes (a target
++  // built or retired bumps g_sasrt_table_epoch; the scans read the keys, the textures and the depth flags alone).
++  const bool memo = sasrt::gpu_round::On(sasrt::gpu_round::kRt2ColorAliasMemo);
++  if (memo && surface->sasrt_alias_epoch == g_sasrt_table_epoch) {
++    out = surface->sasrt_aliases;
++    sasrt::gpu_round::Count(sasrt::gpu_round::kRt2ColorAliasMemo);
++    return;
++  }
++  struct Keep {
++    const HostSurface *surface;
++    std::vector<HostSurface *> &out;
++    bool on;
++    ~Keep() {
++      if (on) {
++        surface->sasrt_aliases = out;
++        surface->sasrt_alias_epoch = g_sasrt_table_epoch;
++        sasrt::gpu_round::Count(sasrt::gpu_round::kRt2ColorAliasMemo, 1, 1);
++      }
++    }
++  } keep{surface, out, memo};
+   // TargetKey: the view in the low 32 bits, the host format above.
+   constexpr uint64_t kViewMask = 0xFFFFFFFFull;
+   uint64_t own = 0;
+   bool found = false;
+@@ -1189,8 +1350,122 @@
+ }
+ 
+ HostSurface *GetHostSurfaceSlow(u32 surface_va, const d3d::SurfaceDesc *desc);
+ 
++// sasrt-nx (2026-10-20): the recorded headers of the op replaying now (SetReplaySurfaceOverridesLocked).
++u32 g_override_va[5] = {};
++d3d::SurfaceDesc g_override_desc[5] = {};
++u32 g_override_count = 0;
++bool g_override_active = false;
++
++// sasrt-nx (2026-10-21): the replaying draw's index buffer object as it was when the draw was made.
++u32 g_replay_ib_va = 0;
++d3d::IndexBuffer g_replay_ib{};
++
++void SetReplayIndexBufferLocked(u32 ib_va, const d3d::IndexBuffer *ib) {
++  g_replay_ib_va = ib ? ib_va : 0;
++  if (g_replay_ib_va)
++    std::memcpy(&g_replay_ib, ib, sizeof(g_replay_ib));
++}
++
++const d3d::IndexBuffer *ReplayIndexBuffer(u32 ib_va) {
++  if (ib_va && ib_va == g_replay_ib_va) {
++    // How often the game had changed the object by the time the draw replayed (what the copy avoids).
++    static uint64_t replays = 0, changed = 0;
++    ++replays;
++    // sasrt-nx (2026-11-20, sasrt_rt2_repeat_recorded_index): the live header (a cache miss) read for this count at one
++    // call in 64 (the draw path asks at every indexed replayed draw).
++    if ((replays & 63u) != 0 && sasrt::gpu_round::On(sasrt::gpu_round::kRt2RepeatRecordedIndex))
++      return &g_replay_ib;
++    if (const auto *live = GuestPtr<const d3d::IndexBuffer>(ib_va);
++        live && (live->Address != g_replay_ib.Address || live->Size != g_replay_ib.Size)) {
++      if (++changed <= 16 || changed % 1000 == 0)
++        RGPU_INFO("[ib] index buffer {:08X} changed since its draw was made: address {:08X} size {} then, "
++                  "{:08X} {} now ({} of {} replays)", ib_va, u32(g_replay_ib.Address), u32(g_replay_ib.Size),
++                  u32(live->Address), u32(live->Size), changed, replays);
++    }
++    return &g_replay_ib;
++  }
++  return ib_va ? GuestPtr<const d3d::IndexBuffer>(ib_va) : nullptr;
++}
++
++// sasrt-nx (2026-11-12, batch C5; the render-thread agent's finding): every captured draw sets its overrides and
++// clears them after (queued.cpp), two epoch bumps a draw, so the next draw's fast path always gathered its targets again
++// (GatherTargets, the slow surface lookups, BindTargets). Lazy: the clear is owed; anything that reads the overrides or
++// the epoch (ReplaySurfaceOverride, SurfaceEpochLocked: the memo reads after the former) applies it first, as it was;
++// a next list equal to the kept one, with nothing read between, undoes the clear: nobody saw it.
++REXCVAR_DEFINE_BOOL(sasrt_surface_override_lazy_clear, true, "SASRT/GPU",
++                    "A replayed draw's surface overrides are cleared lazily: the next draw with the same recorded "
++                    "surfaces keeps its targets (no surface-epoch bump) unless something read the cleared state between. "
++                    "Off: cleared and bumped at once, as before")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++namespace {
++void SettleOverridesSlow() {
++  g_override_owed = false;
++  ++g_surface_epoch;
++  g_override_count = 0;
++}
++bool OverridesLazyOn() {
++  static const bool on = REXCVAR_GET(sasrt_surface_override_lazy_clear);
++  return on;
++}
++}  // namespace
++
++void SetReplaySurfaceOverridesLocked(const u32 *surface_va, const d3d::SurfaceDesc *desc, u32 count) {
++  count = count < 5 ? count : 5;
++  // sasrt-nx (2026-10-29, the banjo-nx sync): other overrides are other targets for the same device words: the
++  // surface epoch moves, which banjo-nx's chain reuse and fast path keep targets by.
++  const auto same_as_kept = [&] {
++    bool same = count == g_override_count;
++    for (u32 i = 0; i < count && same; ++i)
++      same = g_override_va[i] == surface_va[i] && std::memcmp(&g_override_desc[i], &desc[i], sizeof(desc[i])) == 0;
++    return same;
++  };
++  if (OverridesLazyOn()) {  // sasrt-nx (2026-11-12, batch C5)
++    if (count == 0) {
++      if (g_override_count != 0)
++        g_override_owed = true;  // (as before: no bump when there was nothing to clear)
++      return;
++    }
++    if (g_override_owed) {
++      if (same_as_kept()) {
++        g_override_owed = false;  // the clear undone: no one saw it
++        return;
++      }
++      SettleOverridesSlow();  // the clear as it was owed, then the new list as before
++    }
++  }
++  if (same_as_kept())
++    return;
++  ++g_surface_epoch;
++  g_override_count = count;
++  for (u32 i = 0; i < g_override_count; ++i) {
++    g_override_va[i] = surface_va[i];
++    g_override_desc[i] = desc[i];
++  }
++}
++
++bool g_view_pending = false;
++u32 g_view_surface_info = 0, g_view_info = 0;
++bool g_view_depth = false;
++
++void SetSurfaceViewLocked(u32 surface_info, u32 view_info, bool depth) {
++  g_view_pending = true;
++  g_view_surface_info = surface_info;
++  g_view_info = view_info;
++  g_view_depth = depth;
++}
++
++const d3d::SurfaceDesc *ReplaySurfaceOverride(u32 surface_va) {
++  if (g_override_owed) [[unlikely]]
++    SettleOverridesSlow();  // sasrt-nx (2026-11-12, batch C5)
++  for (u32 i = 0; i < g_override_count; ++i)
++    if (g_override_va[i] == surface_va)
++      return &g_override_desc[i];
++  return nullptr;
++}
++
+ // blur-nx (2026-11-10, port 76; its key 215: blur_renut_stack_surface_headers): headers of surfaces on the stack, as the
+ // game bound them (NoteSurfaceHeader, game threads); the render thread reads a surface's header when it replays, by
+ // which time a temporary D3DSurface on the stack has been overwritten. Blur builds one for the clear and resolve that
+ // put its 640x360 motion-blur source in place: read later it was zeros (an empty 1x1 surface), and the frame lost its
+--- base/app/src/renut_engine/gpu/render/surfaces.h
++++ sasrt-nx/app/src/renut_engine/gpu/render/surfaces.h
+@@ -62,16 +64,48 @@
+   // sasrt-nx (2026-10-20, the EDRAM depth restore): g_surface_write_seq at this surface's last write, and for a depth surface
+   // the colour surface's write it was last restored from (RestoreDepthFromColorLocked).
+   uint64_t write_seq = 0;
+   uint64_t restored_from_seq = 0;
+-  // sasrt-nx (2026-11-09, sasrt_rt_restore_candidates; port 54): a depth target's colour targets over its EDRAM base and
+-  // pitch that could be its restore's source, as of the target table's epoch 'sasrt_candidates_epoch' (0: not found yet).
++  bool sasrt_restore_src = false;  // sasrt-nx (2026-11-09, sasrt_gpu_diag_depth_restore): a depth restore has read it
++  // sasrt-nx (2026-11-09, sasrt_gpu_depth_restore_direct; render/draw.cpp SasrtRestoreCopyLocked): SASRT's restore copy draw
++  // (A393B1E0) into this colour target, as its last write ('sasrt_copy_writes' its writes count after it): the depth resolve
++  // destination it read the words of (its guest address, resolves count and signature then), its fetch 0 view and
++  // sampler, that texture's size and the draw's scissor. 'pending': the draw was left out, the image does not hold it
++  // (SasrtMaterialiseCopyLocked draws it before any other use).
++  bool sasrt_copy_known = false, sasrt_copy_pending = false;
++  float sasrt_copy_scale = 1.0f;  // sasrt-nx (2026-11-11, sasrt_gpu_scaled_copy_deferred): the copy draw's resolution scale
++  // sasrt-nx (2026-11-11, renut_diag_gpu_census): the game's restore copy drawn at a scale other than 1x, not yet read
++  mutable bool census_scaled_copy = false;
++  HostTexture *sasrt_copy_src = nullptr;
++  uint32_t sasrt_copy_src_va = 0;
++  uint64_t sasrt_copy_resolves = 0, sasrt_copy_signature = 0, sasrt_copy_writes = 0, sasrt_copy_seq = 0;
++  uint32_t sasrt_copy_slot = 0, sasrt_copy_sampler = 0;
++  float sasrt_copy_size[2] = {};
++  int32_t sasrt_copy_rect[4] = {};
++  // sasrt-nx (2026-11-09, sasrt_gpu_cut_depth_alias): a depth target's depth-plane writes (draws writing depth, depth
++  // clears, restores), and the surface its binds go to instead (by generation) while 'sasrt_alias_seq' is its restore.
++  uint64_t sasrt_depth_writes = 0;
++  HostSurface *sasrt_alias = nullptr;
++  uint64_t sasrt_alias_generation = 0, sasrt_alias_seq = 0;
++  // sasrt-nx (2026-11-09, sasrt_gpu_depth_restore_reuse): the depth resolve its last restore came from (its texture's
++  // address, resolves count and signature then) and its depth-plane writes after that restore.
++  uint32_t sasrt_restored_va = 0;
++  uint64_t sasrt_restored_resolves = 0, sasrt_restored_signature = 0, sasrt_restored_depth_writes = 0;
++  // sasrt-nx (2026-11-09, sasrt_gpu_cut_ambient_sky): the scene's clear depth (0 or 1) its last whole direct restore
++  // kept at the pixels nothing was drawn to, valid while its depth-plane writes are still 'sasrt_sky_depth_writes'.
++  float sasrt_sky_depth = -1.0f;
++  uint64_t sasrt_sky_depth_writes = 0;
++  // sasrt-nx (2026-11-09, sasrt_rt_restore_candidates): a depth target's colour targets over its EDRAM base and pitch
++  // that could be its restore's source, as of the target table's epoch 'sasrt_candidates_epoch' (0: not found yet).
+   std::vector<HostSurface *> sasrt_restore_candidates;
+   uint64_t sasrt_candidates_epoch = 0;
++  // sasrt-nx (2026-11-20, sasrt_rt2_color_alias_memo): ColorAliasesLocked's answer as of the target table's epoch.
++  mutable uint64_t sasrt_alias_epoch = 0;
++  mutable std::vector<HostSurface *> sasrt_aliases;
+   // halo3-nx (2026-11-03): when it was last bound to draw to, and what of another format's target over the same EDRAM view it
+   // holds (SyncColorViewLocked).
+   uint64_t bound_serial = 0;
+-  uint64_t sasrt_used_frame = 0;  // sasrt-nx (2026-11-09, sasrt_retire_idle_targets_frames; port 58): last looked up
++  uint64_t sasrt_used_frame = 0;  // sasrt-nx (2026-11-09, sasrt_retire_idle_targets_frames): the last frame looked up
+   const HostSurface *synced_view = nullptr;
+   uint64_t synced_writes = 0;
+ 
+   // In guest pixels; the host target is 'scale' times that on each axis
+--- base/app/src/renut_engine/gpu/guest/command_buffers.cpp
++++ sasrt-nx/app/src/renut_engine/gpu/guest/command_buffers.cpp
+@@ -40,17 +40,26 @@
+ #include "renut_engine/gpu/d3d/d3d.h"
+ #include "renut_engine/gpu/d3d/d3d_native.h"  // banjo-nx (2026-10-26): the setters' marks (banjo_renut_tags)
+ #include "renut_engine/gpu/guest/guest_memory.h"
+ #include "renut_engine/gpu/log.h"
++#include "renut_engine/sasrt_trace.h"  // sasrt-nx (2026-11-08, sasrt_renut_diag_trace)
+ #include "renut_engine/gpu/guest/callbacks.h"  // banjo-nx (from sa2-nx): HookFastPathsOn
+ #include "renut_engine/gpu/backend/queued.h"
+ #include "renut_engine/gpu/backend/render_thread.h"
+ #include "renut_engine/gpu/banjo_renut_tuning.h"
++#include "renut_engine/gpu/render/surfaces.h"
+ #include "renut_engine/gpu/ultimate.h"
+ #include "renut_engine/gpu/render/draw.h"  // banjo-nx (2026-10-20): ChainHint
+ #include "renut_engine/gpu/guest/resources.h"  // banjo-nx (2026-10-23): PrefetchShaderLocked
+ #include "renut_engine/gpu/render/texture_layout.h"  // banjo-nx (2026-10-27): the slots' extents (GetTextureDataSizes)
+ #include "renut_engine/gpu/render/textures.h"  // banjo-nx (2026-10-28): TextureFrameLocked (the packet census's frames)
++#include "renut_engine/gpu/backend/video.h"  // sasrt-nx (2026-11-20, sasrt_rt2_place_wait_unlocked): State().mutex
++#include "renut_engine/gpu/sasrt_gpu_round.h"  // sasrt-nx (2026-11-20): the second render-thread round's switches
++#include <rex/cvar.h>
++REXCVAR_DEFINE_INT32(sasrt_rt3_place_spin_us, 400, "SASRT/RenderThread",
++                     "sasrt_rt3_place_spin: how long (us) the render thread spins on a same-frame place before it sleeps")
++    .range(0, 5000)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ #include "renut_engine/gpu/render/surfaces.h"  // blur-nx (2026-11-10, port 76; its key 215): StackHeaderSet
+ 
+ #include <rex/cvar.h>
+ 
+@@ -108,8 +117,9 @@
+                     "setters marked as written since the device's previous op, not all 53 (the same op, the same "
+                     "bytes: the rest are unchanged). Off: every chunk compared, as before")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DECLARE(bool, banjo_renut_host_packets);  // banjo-nx (2026-10-28): render/draw.cpp
++REXCVAR_DECLARE(bool, sasrt_rt3_host_packets_split);  // sasrt-nx (2026-11-20): sasrt_gpu_round.cpp
+ REXCVAR_DEFINE_BOOL(banjo_renut_diag_packet_census, false, "Banjo/Diagnostics",
+                     "Renut's renderer (2026-10-28, host draw packets): every 10 s, how many replayed draws a cache keyed "
+                     "by the draw's whole device state (not the float constants) would answer, and how many of those "
+                     "re-derive state today. Hashes 3 KB a draw: diagnostics only")
+@@ -2300,9 +2409,11 @@
+ // work, goes into the device's own buffer, which only its recording thread
+ // touches until the buffer runs.
+ // banjo-nx (2026-10-28, host packets): the state keys are made while packets or their census are on.
+ inline bool HostPacketKeysOn() {
+-  return REXCVAR_GET(banjo_renut_host_packets) || REXCVAR_GET(banjo_renut_diag_packet_census);
++  // sasrt-nx (2026-11-20): sasrt_rt3_host_packets_split's draws need the keys too (the recording makes them always then).
++  return REXCVAR_GET(banjo_renut_host_packets) || REXCVAR_GET(banjo_renut_diag_packet_census) ||
++         REXCVAR_GET(sasrt_rt3_host_packets_split);
+ }
+ // banjo-nx (2026-10-28, host packets): a chunk's part of the state key: its content's 64-bit hash (the PMULL CRC-64 the
+ // stream and texture checks use) with its index, through a 64-bit finaliser (a bijection, so the XOR of the chunks' parts
+ // is not linear in their bytes the way the CRCs alone would be).
+@@ -4689,12 +4909,519 @@
+         draws += op.kind == OpKind::Draw;
+       NoteCommandBufferRun(reinterpret_cast<const void *>(uintptr_t(recording->id)), draws, swap);
+     }
+   }
++  run->submitted_swap = rex::latency::SwapCount();  // sasrt-nx (2026-11-04, replay tags)
+   // vivapinata-nx (2026-11-11, vivapinata_tiles_once): a tile's run may wait for its twin (TilesOnce).
++  // sasrt-nx (2026-11-13, base port 87): QueueReplay sets sasrt-nx's replay tag and depth-writer marks as before.
+   if (TilesOnce(device_va, device, command_buffer_va, run))
+     return;
+   QueueReplay(run, command_buffer_va, Predication(run->running.data()));
++}
++
++// sasrt-nx (2026-10-21): recordings captured ahead of their run (command_buffers.h).
++struct CapturedRun {
++  BufferSet buffers;
++};
++
++std::shared_ptr<CapturedRun> CaptureCommandBufferRun(u32 command_buffer_va) {
++  auto captured = std::make_shared<CapturedRun>();
++  std::lock_guard lock(g_record_mutex);
++  CaptureBuffers(command_buffer_va, 0, captured->buffers);
++  return captured;
++}
++
++// sasrt-nx (2026-11-04, sasrt_renut_diag_splice_pm4): the vertex float constants c<first_reg>.. (count registers) as the
++// captured run's buffer recorded them for its first draw: its ops' state applied in order over a blank device image
++// (the first op copies every chunk and group), read at the first draw. False when the buffer or a draw is missing.
++// sasrt-nx (2026-11-08, sasrt_renut_diag_trace): command_buffers.h.
++bool CapturedRunFindVertexConstants(const CapturedRun &run, u32 command_buffer_va, u32 first_reg, u32 count,
++                                    bool (*match)(const u32 *), u32 *out) {
++  auto it = run.buffers.find(command_buffer_va);
++  if (it == run.buffers.end() || !it->second || first_reg + count > 256)
++    return false;
++  const HostCommandBuffer &b = *it->second;
++  std::vector<u8> image(d3d::kDeviceSnapshotSize, 0);
++  for (const Op &op : b.ops) {
++    if (op.state == kNone)
++      continue;
++    ApplyState(image.data(), b.arena.data() + op.state, op.plain_dirty, op.vs_dirty, op.ps_dirty);
++    if (op.kind == OpKind::Draw) {
++      std::memcpy(out, image.data() + kVertexShaderF + size_t(first_reg) * 16, size_t(count) * 16);
++      if (match(out))
++        return true;
++    }
++  }
++  return false;
++}
++
++bool CapturedRunVertexConstants(const CapturedRun &run, u32 command_buffer_va, u32 first_reg, u32 count, u32 *out) {
++  auto it = run.buffers.find(command_buffer_va);
++  if (it == run.buffers.end() || !it->second || first_reg + count > 256)
++    return false;
++  const HostCommandBuffer &b = *it->second;
++  std::vector<u8> image(d3d::kDeviceSnapshotSize, 0);
++  for (const Op &op : b.ops) {
++    if (op.state == kNone)
++      continue;
++    ApplyState(image.data(), b.arena.data() + op.state, op.plain_dirty, op.vs_dirty, op.ps_dirty);
++    if (op.kind == OpKind::Draw) {
++      std::memcpy(out, image.data() + kVertexShaderF + size_t(first_reg) * 16, size_t(count) * 16);
++      return true;
++    }
++  }
++  return false;
++}
++
++// sasrt-nx (2026-11-04, sasrt_renut_splice_ended): the buffer a device is recording (0: none), a recording marked
++// ended (the game's EndCommandBuffer), and a buffer's recording captured only when it is ended and no splice took
++// it before (a buffer not recorded again since holds the previous frame's): state 0 taken, 1 still being
++// recorded (begun, not ended), 2 taken before and not recorded again, 3 no recording.
++u32 RecordingCommandBuffer(u32 device_va) {
++  return RecordingBuffer(device_va);
++}
++
++// sasrt-nx (2026-11-09 night, the memory report's new CPU line, run mem13: the 63 recorded buffers held 247 MB of
++// capacity for 29-47 MB of recordings: a new recording takes a spare buffer whatever its capacity, up to kMaxKeptArena
++// (8 MB), and keeps it). At the game's EndCommandBuffer, on the recording thread (nothing replays the recording before
++// it is ended, nor holds a pointer into its arena: ops hold offsets), a vector with more than 1 MB past three times what
++// it holds goes down to that plus a quarter: one copy of what was recorded. A buffer recorded every frame at a steady
++// size stays (its capacity is within three times its size after the first such cut).
++REXCVAR_DEFINE_BOOL(sasrt_cmdbuf_trim_ended, true, "SASRT/Graphics",
++                    "A recorded command buffer whose capacity is more than three times what it holds (and 1 MB more) is "
++                    "cut to what it holds plus a quarter when the game ends the recording (run mem13: 247 MB of capacity "
++                    "for 29-47 MB recorded); the same commands")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++// sasrt-nx (2026-11-10): the cut's ratio (percent of what the recording holds) and the slack past it, as keys to tune
++// (run mem16: 22-30 MB recorded in 106 MB of capacity with 300 % and 1 MB).
++REXCVAR_DEFINE_INT32(sasrt_cmdbuf_trim_percent, 300, "SASRT/Graphics",
++                     "sasrt_cmdbuf_trim_ended: a recording's vector is cut when its capacity is past this percent of "
++                     "what it holds (and sasrt_cmdbuf_trim_slack_kb more)")
++    .range(110, 10000)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_INT32(sasrt_cmdbuf_trim_slack_kb, 1024, "SASRT/Graphics",
++                     "sasrt_cmdbuf_trim_ended: the capacity past the ratio before a cut, in KB")
++    .range(16, 1048576)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++template <typename V>
++size_t TrimEnded(V &v) {
++  static const size_t percent = size_t(REXCVAR_GET(sasrt_cmdbuf_trim_percent));
++  static const size_t slack = size_t(REXCVAR_GET(sasrt_cmdbuf_trim_slack_kb)) << 10;
++  const size_t elem = sizeof(typename V::value_type);
++  const size_t size = v.size(), cap = v.capacity();
++  const size_t limit = size * percent / 100;
++  if (cap <= limit || (cap - limit) * elem < slack)
++    return 0;
++  V cut;
++  cut.reserve(size + size / 4);
++  cut.insert(cut.end(), v.begin(), v.end());
++  const size_t freed = (cap - cut.capacity()) * elem;
++  v.swap(cut);
++  return freed;
++}
++std::atomic<uint64_t> g_trimmed_bytes{0}, g_trimmed_count{0};
++
++void MarkRecordingEnded(u32 command_buffer_va) {
++  std::lock_guard lock(g_record_mutex);
++  auto it = g_buffers.find(command_buffer_va);
++  if (it != g_buffers.end() && it->second) {
++    static const bool trim = REXCVAR_GET(sasrt_cmdbuf_trim_ended);
++    if (trim && !it->second->ended) {  // sasrt-nx (2026-11-09 night): see above
++      const size_t freed = TrimEnded(it->second->arena) + TrimEnded(it->second->ops);
++      if (freed) {
++        const uint64_t n = g_trimmed_count.fetch_add(1, std::memory_order_relaxed) + 1;
++        const uint64_t total = g_trimmed_bytes.fetch_add(freed, std::memory_order_relaxed) + freed;
++        if (n <= 4 || (n & 1023) == 0)
++          RGPU_INFO("[renut] command buffers: {} recordings cut at their end so far, {} MB given back "
++                    "(sasrt_cmdbuf_trim_ended)", n, total >> 20);
++      }
++    }
++    if (!it->second->ended && it->second->begun_us) {  // sasrt-nx (2026-11-10, item 4's measure)
++      const uint64_t now = SasrtNowUs();
++      it->second->ended_us = now;
++      g_slot_timing.record_us.fetch_add(now - it->second->begun_us, std::memory_order_relaxed);
++      g_slot_timing.records.fetch_add(1, std::memory_order_relaxed);
++    }
++    it->second->ended = true;
++    it->second->ended_swap = rex::latency::SwapCount();
++  }
++}
++
++// The tag of a run about to be replayed: its top buffer's recording and swap counts (declared before
++// QueueRunCommandBuffer, its first use).
++SasrtReplayTag SasrtTagOf(const BufferSet &buffers, u32 command_buffer_va, uint64_t submitted) {
++  SasrtReplayTag tag;
++  tag.buffer = command_buffer_va;
++  tag.submitted = submitted;
++  auto it = buffers.find(command_buffer_va);
++  if (it != buffers.end() && it->second) {
++    tag.recording = it->second->id;
++    tag.begun = it->second->begun_swap;
++    tag.ended = it->second->ended_swap;
++  }
++  return tag;
++}
++
++std::shared_ptr<CapturedRun> CaptureIfEndedRun(u32 command_buffer_va, int *state) {
++  std::lock_guard lock(g_record_mutex);
++  auto it = g_buffers.find(command_buffer_va);
++  if (it == g_buffers.end() || !it->second) {
++    if (state)
++      *state = 3;
++    return nullptr;
++  }
++  if (!it->second->ended) {
++    if (state)
++      *state = 1;
++    return nullptr;
++  }
++  if (it->second->captured) {
++    if (state)
++      *state = 2;
++    return nullptr;
++  }
++  it->second->captured = true;
++  if (const uint64_t ended = it->second->ended_us) {  // sasrt-nx (2026-11-10, item 4's measure): End -> splice
++    g_slot_timing.end_to_splice_us.fetch_add(SasrtNowUs() - ended, std::memory_order_relaxed);
++    g_slot_timing.splices.fetch_add(1, std::memory_order_relaxed);
++  }
++  auto captured = std::make_shared<CapturedRun>();
++  CaptureBuffers(command_buffer_va, 0, captured->buffers);
++  if (state)
++    *state = 0;
++  return captured;
++}
++
++// sasrt-nx (2026-10-21, sasrt_renut_capture_recorded_streams).
++const SasrtStreamCopies *g_sasrt_stream_copies = nullptr;
++std::vector<std::shared_ptr<SasrtStreamCopies>> g_sasrt_copies_alive;  // render thread
++
++void SasrtReleaseStreamCopies() {
++  g_sasrt_copies_alive.clear();
++}
++
++bool SasrtCaptureStreamsOn() {
++  static const bool on = REXCVAR_GET(sasrt_renut_capture_recorded_streams);
++  return on;
++}
++
++// The bound vertex streams of a draw being recorded (the ones copied at the submission), with their strides.
++void SasrtNoteStreamRanges(const u8 *bytes, SasrtStreamHashes &out) {
++  out.count = 0;
++  for (u32 s = 0; s < 16u && out.count < 4; ++s) {
++    if (!u32(*reinterpret_cast<const be_u32 *>(bytes + d3d::kDeviceOffsetStreamSources + s * 4)))
++      continue;
++    const u8 *w = bytes + offsetof(d3d::Device, m_Constants) +
++                  (d3d::kFirstVertexFetchIndex + d3d::StreamFetchIndex(s)) * 8;
++    const u32 w0 = *reinterpret_cast<const be_u32 *>(w), w1 = *reinterpret_cast<const be_u32 *>(w + 4);
++    const u32 va = w0 & ~3u, size = w1 & 0x3FFFFFCu;
++    if (!va || !size)
++      continue;
++    out.va[out.count] = va;
++    out.size[out.count] = size;
++    out.stream[out.count] = s;
++    out.stride[out.count] = u32(bytes[d3d::kDeviceOffsetStreamStrides + s]) * 4;
++    ++out.count;
++  }
++}
++
++void SasrtCountStreamCopies(const SasrtStreamCopies &copies, uint64_t copied) {
++  static std::atomic<uint64_t> runs{0}, streams{0}, bytes{0}, spanned{0};
++  uint64_t b = 0;
++  for (const auto &entry : copies)
++    b += entry.second.size;
++  streams += copies.size();
++  bytes += copied;
++  spanned += b;
++  const uint64_t n = ++runs;
++  if (n % 600 == 0)
++    RGPU_INFO("[sasrt] recorded runs' vertex streams copied at their submission: {} runs, {} streams, {:.1f} MB "
++              "copied of {:.1f} MB they span (sasrt_renut_capture_recorded_streams)", n, streams.load(),
++              bytes.load() / 1048576.0, spanned.load() / 1048576.0);
++}
++
++void QueueCapturedRun(u32 device_va, u32 command_buffer_va, std::shared_ptr<CapturedRun> captured) {
++  if (!captured) {
++    QueueRunCommandBuffer(device_va, command_buffer_va);
++    return;
++  }
++  FlushDeferredVertices(device_va);
++  const u8 *device = GuestPtr<const u8>(device_va);
++  if (!device)
++    return;
++  struct Run {
++    std::vector<u8> running;  // the running device, whose constants the buffer inherits
++    std::shared_ptr<CapturedRun> captured;
++    std::shared_ptr<SasrtStreamCopies> copies;  // sasrt-nx (sasrt_renut_capture_recorded_streams)
++  };
++  auto run = std::make_shared<Run>();
++  run->running.assign(device, device + d3d::kDeviceSnapshotSize);
++  run->captured = std::move(captured);
++  if (SasrtCaptureStreamsOn()) {  // sasrt-nx (2026-10-21, sasrt_renut_capture_recorded_streams): copied now
++    // Per stream (GPU address): its size, the stride its draws read it with (~0u: they differ, so all of it) and
++    // the vertex ranges they read (PrepareGeometry's: base vertex plus the lowest to the highest index).
++    struct Want {
++      u32 size = 0, stride = 0;
++      std::vector<std::pair<u32, u32>> ranges;  // [first, last] vertex
++    };
++    std::unordered_map<u32, Want> wants;
++    for (const auto &[buffer_va, buffer] : run->captured->buffers) {
++      if (!buffer)
++        continue;
++      for (const Op &op : buffer->ops) {
++        if (op.kind != OpKind::Draw || !op.sasrt_ranges.count)
++          continue;
++        u32 first = 0, last = ~0u;  // ~0u: unknown, the whole stream
++        if (!op.call.tessellation && op.call.count) {
++          if (!op.call.indexed) {
++            first = op.call.start_vertex;
++            last = first + op.call.count - 1;
++          } else {
++            const u8 *src = nullptr;
++            bool is32 = false;
++            u32 endian = 0;
++            if (op.call.up_indices != kNoUp) {  // as Replay (CallOf)
++              is32 = op.call.up_indices_32;
++              endian = is32 ? 2 : 1;
++              src = buffer->arena.data() + op.call.up_indices + size_t(op.call.start_index) * (is32 ? 4 : 2);
++            } else if (op.ib_va) {
++              is32 = (u32(op.ib.resource.Common) & d3d::kIndexBufferCommon32Bit) != 0;
++              endian = d3d::IndexBufferEndian(u32(op.ib.resource.Common));
++              if (const u8 *base = GuestPhysicalPtr<const u8>(u32(op.ib.Address)))
++                src = base + size_t(op.call.start_index) * (is32 ? 4 : 2);
++            }
++            if (src) {
++              u32 lo = ~0u, hi = 0;
++              for (u32 k = 0; k < op.call.count; ++k) {
++                u32 v;
++                if (is32) {
++                  std::memcpy(&v, src + k * 4, 4);
++                  if (endian == 2)  // as SwapEndian
++                    v = __builtin_bswap32(v);
++                  else if (endian == 1)
++                    v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
++                  else if (endian == 3)
++                    v = (v >> 16) | (v << 16);
++                } else {
++                  uint16_t h;
++                  std::memcpy(&h, src + k * 2, 2);
++                  v = (endian == 1 || endian == 2) ? __builtin_bswap16(h) : h;  // as ReadIndices
++                }
++                lo = std::min(lo, v);
++                hi = std::max(hi, v);
++              }
++              if (lo <= hi && hi - lo < (1u << 20)) {
++                first = u32(int64_t(op.call.base_vertex) + lo);
++                last = u32(int64_t(op.call.base_vertex) + hi);
++              }
++            }
++          }
++        }
++        for (u32 i = 0; i < op.sasrt_ranges.count; ++i) {
++          if (op.sasrt_ranges.stream[i] == 0 && op.call.up_vertices != kNoUp)
++            continue;  // its own copy
++          Want &want = wants[op.sasrt_ranges.va[i]];
++          want.size = std::max(want.size, op.sasrt_ranges.size[i]);
++          const u32 stride = op.sasrt_ranges.stride[i];
++          if (!stride || last == ~0u)
++            want.stride = ~0u;
++          else if (want.stride != ~0u && want.stride != stride)
++            want.stride = want.stride ? ~0u : stride;
++          if (want.stride != ~0u)
++            want.ranges.emplace_back(first, last);
++        }
++      }
++    }
++    auto copies = std::make_shared<SasrtStreamCopies>();
++    uint64_t copied = 0;
++    for (auto &[stream_va, want] : wants) {
++      const u8 *p = GuestPhysicalPtr<const u8>(stream_va);
++      if (!p || !want.size)
++        continue;
++      // 12:40: whole streams only, up to 2 MB (the ranges left bytes some draws read unfilled: a PC race drew
++      // planes across the screen in most frames); a bigger stream is read from guest memory, as without the key.
++      if (want.size > (2u << 20))
++        continue;
++      want.stride = ~0u;
++      SasrtStreamCopy &copy = (*copies)[stream_va];
++      copy.data.reset(new u8[want.size]);
++      copy.size = want.size;
++      if (want.stride == ~0u || want.ranges.empty()) {
++        std::memcpy(copy.data.get(), p, want.size);
++        copied += want.size;
++        continue;
++      }
++      copy.stride = want.stride;
++      std::sort(want.ranges.begin(), want.ranges.end());
++      uint64_t end = 0;  // bytes copied so far from the start of the stream
++      for (const auto &[a, b] : want.ranges) {
++        uint64_t from = std::max<uint64_t>(uint64_t(a) * want.stride, end);
++        const uint64_t to = std::min<uint64_t>((uint64_t(b) + 1) * want.stride, want.size);
++        if (from < to) {
++          std::memcpy(copy.data.get() + from, p + from, size_t(to - from));
++          copied += to - from;
++          end = to;
++        }
++      }
++    }
++    SasrtCountStreamCopies(*copies, copied);
++    run->copies = std::move(copies);
++  }
++  if (SasrtLateStreamsOn()) {  // sasrt-nx (2026-10-21, sasrt_renut_diag_late_streams): the 360 reads them now
++    for (const auto &[va, buffer] : run->captured->buffers) {
++      if (!buffer)
++        continue;
++      for (const Op &op : buffer->ops) {
++        if (op.kind != OpKind::Draw)
++          continue;
++        for (u32 i = 0; i < op.sasrt_streams.count; ++i)
++          SasrtNoteKickRange(op.sasrt_streams.va[i], op.sasrt_streams.size[i]);
++        if (op.call.indexed && op.call.up_indices == kNoUp && op.ib_va) {
++          const u32 esize = (u32(op.ib.resource.Common) & d3d::kIndexBufferCommon32Bit) ? 4u : 2u;
++          SasrtNoteKickRange(u32(op.ib.Address) + op.call.start_index * esize,
++                             std::min<u32>(op.call.count * esize, 4096u));
++        }
++      }
++    }
++    SasrtQueueKickHashes();
++  }
++  const uint64_t submitted_swap = rex::latency::SwapCount();  // sasrt-nx (2026-11-04, replay tags)
++  render_thread::Queue([run, command_buffer_va, submitted_swap] {
++    const u8 *running = run->running.data();
++    g_sasrt_replay_tag = SasrtTagOf(run->captured->buffers, command_buffer_va, submitted_swap);
++    g_sasrt_stream_copies = run->copies.get();  // sasrt-nx (sasrt_renut_capture_recorded_streams)
++    SasrtSeqNoteRun(true);  // sasrt-nx (2026-11-08, sasrt_renut_diag_depth_writers)
++    Replay(running, run->captured->buffers, command_buffer_va, 0, Predication(running));
++    SasrtSeqNoteRun(false);
++    g_sasrt_replay_tag = SasrtReplayTag{};  // the game thread's own draws next: untagged
++    g_sasrt_stream_copies = nullptr;
++    if (run->copies)
++      g_sasrt_copies_alive.push_back(run->copies);  // the run's fills convert at the next flush
++  });
++}
++
++// sasrt-nx (2026-11-08, sasrt_renut_scene_same_frame): command_buffers.h.
++std::atomic<uint64_t> g_slot_filled{0}, g_slot_fallbacks{0}, g_slot_longest_us{0};
++
++// sasrt-nx (2026-11-10, the thread-latency round, item 4's measure): where the render thread's wait at a same-frame
++// place goes: the worker's recording (Begin to End), the recording's End to the game's splice (which fills the place),
++// and the render thread's wait itself; averages over the last report.
++std::string SasrtSlotTimingReport() {
++  const auto take = [](std::atomic<uint64_t> &a) { return a.exchange(0, std::memory_order_relaxed); };
++  const uint64_t rec = take(g_slot_timing.record_us), recs = take(g_slot_timing.records);
++  const uint64_t gap = take(g_slot_timing.end_to_splice_us), splices = take(g_slot_timing.splices);
++  const uint64_t wait = take(g_slot_timing.wait_us), waits = take(g_slot_timing.waits);
++  const auto avg = [](uint64_t total, uint64_t n) { return n ? double(total) / double(n) / 1000.0 : 0.0; };
++  return fmt::format("same-frame places' timing: the render thread waited {:.2f} ms a place ({} places); recordings "
++                     "{:.2f} ms from Begin to End ({}); End to the splice {:.2f} ms ({})",
++                     avg(wait, waits), waits, avg(rec, recs), recs, avg(gap, splices), splices);
++}
++
++void FillCapturedRunSlot(SasrtRunSlot &slot, u32 buffer, std::shared_ptr<CapturedRun> recording) {
++  {
++    std::lock_guard lock(slot.mutex);
++    if (slot.filled)
++      return;
++    slot.buffer = buffer;
++    slot.recording = std::move(recording);
++    slot.filled = true;
++    slot.ready.store(true, std::memory_order_release);  // sasrt-nx (2026-11-20, sasrt_rt3_place_spin)
++  }
++  slot.cv.notify_all();
++}
++
++void SasrtRunSlotCounts(uint64_t &filled, uint64_t &fallbacks, uint64_t &longest_wait_us) {
++  filled = g_slot_filled.exchange(0, std::memory_order_relaxed);
++  fallbacks = g_slot_fallbacks.exchange(0, std::memory_order_relaxed);
++  longest_wait_us = g_slot_longest_us.exchange(0, std::memory_order_relaxed);
++}
++
++void QueueCapturedRunSlot(u32 device_va, std::shared_ptr<SasrtRunSlot> slot, uint32_t timeout_ms) {
++  FlushDeferredVertices(device_va);
++  const u8 *device = GuestPtr<const u8>(device_va);
++  if (!device)
++    return;
++  // The running device as at the submission (the constants a run inherits), as QueueCapturedRun.
++  auto running = std::make_shared<std::vector<u8>>(device, device + d3d::kDeviceSnapshotSize);
++  const uint64_t submitted_swap = rex::latency::SwapCount();
++  render_thread::Queue([running, slot, timeout_ms, submitted_swap] {
++    std::shared_ptr<CapturedRun> recording;
++    u32 buffer = 0;
++    {
++      const auto waiting = std::chrono::steady_clock::now();
++      // sasrt-nx (2026-11-20, sasrt_rt2_place_wait_unlocked; the second render-thread round): the wait without
++      // State().mutex (this item runs with it held: render_thread Execute), so the game thread's destroys and
++      // creates that take it are not held up by the place (up to the timeout). Waiting here touches no renderer state;
++      // anything another thread does meanwhile is as if done before this item began. The slot's mutex is let go
++      // before State().mutex is taken again (never the one inside the other).
++      if (sasrt::gpu_round::On(sasrt::gpu_round::kRt2PlaceWaitFree)) {
++        bool ready;
++        {
++          std::lock_guard peek(slot->mutex);
++          ready = slot->filled;
++        }
++        if (!ready) {
++          State().mutex.unlock();
++          // sasrt-nx (2026-11-20, sasrt_rt3_place_spin; the third render-thread round's #2): the first part of the
++          // wait spun on the slot's flag (the render thread has core 1 to itself), so a recording that ends within it
++          // is taken without a sleep and the kernel's wake (the places waited 1.2 ms on average, four a frame with four
++          // players); then the wait as before.
++          if (sasrt::gpu_round::On(sasrt::gpu_round::kRt3PlaceSpin)) {
++            static const int32_t spin_us = REXCVAR_GET(sasrt_rt3_place_spin_us);
++            const auto spin_until = waiting + std::chrono::microseconds(spin_us);
++            uint32_t n = 0;
++            while (!slot->ready.load(std::memory_order_acquire)) {
++#if defined(__aarch64__)
++              __asm__ volatile("yield");
++#endif
++              if ((++n & 63u) == 0 && std::chrono::steady_clock::now() >= spin_until)
++                break;
++            }
++            if (slot->ready.load(std::memory_order_acquire))
++              sasrt::gpu_round::Count(sasrt::gpu_round::kRt3PlaceSpin);
++            else
++              sasrt::gpu_round::Count(sasrt::gpu_round::kRt3PlaceSpin, 1, 1);  // slept after the spin (the line's /n)
++          }
++          {
++            std::unique_lock lock(slot->mutex);
++            slot->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&slot] { return slot->filled; });
++          }
++          State().mutex.lock();
++          sasrt::gpu_round::Count(sasrt::gpu_round::kRt2PlaceWaitFree);
++        }
++      }
++      std::unique_lock lock(slot->mutex);
++      const auto left = std::chrono::milliseconds(timeout_ms) -
++                        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - waiting);
++      if (!slot->filled && left.count() > 0)
++        slot->cv.wait_for(lock, left, [&slot] { return slot->filled; });
++      const uint64_t waited = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                                           std::chrono::steady_clock::now() - waiting).count());
++      uint64_t longest = g_slot_longest_us.load(std::memory_order_relaxed);
++      while (waited > longest && !g_slot_longest_us.compare_exchange_weak(longest, waited)) {
++      }
++      g_slot_timing.wait_us.fetch_add(waited, std::memory_order_relaxed);  // sasrt-nx (2026-11-10, item 4's measure)
++      g_slot_timing.waits.fetch_add(1, std::memory_order_relaxed);
++      if (slot->filled && slot->recording) {
++        recording = slot->recording;
++        buffer = slot->buffer;
++        g_slot_filled.fetch_add(1, std::memory_order_relaxed);
++      } else {
++        recording = slot->fallback;
++        buffer = slot->fallback_buffer;
++        g_slot_fallbacks.fetch_add(1, std::memory_order_relaxed);
++      }
++      slot->filled = true;  // a late fill changes nothing now
++    }
++    if (!recording || !buffer)
++      return;
++    const u8 *run_device = running->data();
++    g_sasrt_replay_tag = SasrtTagOf(recording->buffers, buffer, submitted_swap);
++    SasrtSeqNoteRun(true);
++    Replay(run_device, recording->buffers, buffer, 0, Predication(run_device));
++    SasrtSeqNoteRun(false);
++    g_sasrt_replay_tag = SasrtReplayTag{};
++  });
+ }
+ 
+ void ReleaseCommandBuffer(u32 command_buffer_va) {
+   std::lock_guard lock(g_record_mutex);
+--- base/app/src/renut_engine/gpu/guest/command_buffers.h
++++ sasrt-nx/app/src/renut_engine/gpu/guest/command_buffers.h
+@@ -73,8 +78,66 @@
+ // buffer's replay on it, with the device's state now (the constants the
+ // buffer inherits).
+ void QueueRunCommandBuffer(u32 device_va, u32 command_buffer_va);
+ 
++// sasrt-nx (2026-10-21): a buffer's recording (and those it runs) as it is now, for a run queued later
++// (QueueCapturedRun): what a composed command buffer's splice points at (sasrt_renut_hooks.cpp).
++struct CapturedRun;
++std::shared_ptr<CapturedRun> CaptureCommandBufferRun(u32 command_buffer_va);
++// QueueRunCommandBuffer with the recording captured before (null: as it is now).
++void QueueCapturedRun(u32 device_va, u32 command_buffer_va, std::shared_ptr<CapturedRun> captured);
++// sasrt-nx (2026-11-04, sasrt_renut_splice_ended): the buffer a device records now (0: none); a recording marked
++// ended by the game's EndCommandBuffer; a buffer's recording captured only once ended and not taken before
++// (state: 0 taken, 1 still being recorded, 2 taken before and not recorded again, 3 none).
++u32 RecordingCommandBuffer(u32 device_va);
++void MarkRecordingEnded(u32 command_buffer_va);
++std::shared_ptr<CapturedRun> CaptureIfEndedRun(u32 command_buffer_va, int *state);
++// sasrt-nx (2026-11-04, sasrt_renut_diag_splice_pm4): c<first_reg>.. of the run's buffer as its first draw recorded them.
++bool CapturedRunVertexConstants(const CapturedRun &run, u32 command_buffer_va, u32 first_reg, u32 count, u32 *out);
++// sasrt-nx (2026-11-08, sasrt_renut_scene_same_frame): a captured run queued before its recording exists. The
++// render thread, at the run's place, waits for the slot to be filled (the recording spliced after the
++// submission) up to a timeout, then replays it, or the fallback (the recording the submission named).
++struct SasrtRunSlot {
++  std::mutex mutex;
++  std::condition_variable cv;
++  bool filled = false;
++  // sasrt-nx (2026-11-20, sasrt_rt3_place_spin): set (release) with 'filled' by FillCapturedRunSlot, so the render
++  // thread can watch it without the mutex while it spins before sleeping.
++  std::atomic<bool> ready{false};
++  u32 buffer = 0;
++  std::shared_ptr<CapturedRun> recording;
++  u32 fallback_buffer = 0;
++  std::shared_ptr<CapturedRun> fallback;
++};
++void QueueCapturedRunSlot(u32 device_va, std::shared_ptr<SasrtRunSlot> slot, uint32_t timeout_ms);
++void FillCapturedRunSlot(SasrtRunSlot &slot, u32 buffer, std::shared_ptr<CapturedRun> recording);
++// The slots' counts since the last call: filled in time, fallen back, the longest wait (us).
++void SasrtRunSlotCounts(uint64_t &filled, uint64_t &fallbacks, uint64_t &longest_wait_us);
++// sasrt-nx (2026-11-08, sasrt_renut_diag_trace): the same for the first draw whose registers satisfy 'match' (the
++// device image's big-endian words).
++bool CapturedRunFindVertexConstants(const CapturedRun &run, u32 command_buffer_va, u32 first_reg, u32 count,
++                                    bool (*match)(const u32 *), u32 *out);
++// sasrt-nx (2026-11-04, replay tags): the recording being replayed on the render thread (set before each run's
++// Replay; the resolves copy it into their destinations: HostTexture::sasrt_tag_*).
++struct SasrtReplayTag {
++  u32 buffer = 0;
++  uint64_t recording = 0, begun = 0, ended = 0, submitted = 0;
++};
++extern SasrtReplayTag g_sasrt_replay_tag;
++
++// sasrt-nx (2026-10-21, sasrt_renut_capture_recorded_streams): the vertex streams of the run being replayed as they
++// were at its submission, by GPU address (GetStreamSource reads these instead of guest memory); nullptr outside.
++// 'data' spans the stream's 'size' bytes, of which only the vertices the run's draws read at 'stride' are filled
++// (stride 0: all of them).
++struct SasrtStreamCopy {
++  std::unique_ptr<u8[]> data;
++  u32 size = 0, stride = 0;
++};
++using SasrtStreamCopies = std::unordered_map<u32, SasrtStreamCopy>;
++extern const SasrtStreamCopies *g_sasrt_stream_copies;
++// After a flush converted the fills that point into the copies (FlushVertexFillsLocked).
++void SasrtReleaseStreamCopies();
++
+ void ReleaseCommandBuffer(u32 command_buffer_va);
+ 
+ // banjo-nx (2026-10-28, the heap): the spare buffers given back while the heap's room is below 256 MB (checked every
+ // 5 s; the frame's hook calls it).
+--- base/app/src/renut_engine/gpu/backend/render_thread.cpp
++++ sasrt-nx/app/src/renut_engine/gpu/backend/render_thread.cpp
+@@ -110,48 +141,172 @@
+ 
+ struct Item {
+   std::function<void()> work;
+   bool locked = true;  // run with State().mutex held
+-  const void *prefetch[2] = {};  // banjo-nx (2026-10-20, from sa2-nx, banjo_renut_prefetch_next): fetched while the item before runs
++  const void *prefetch[2] = {};  // sa2-nx (2026-10-20, sa2_renut_prefetch_next): fetched while the item before runs
+ };
+ 
+-// banjo-nx (2026-10-20, from sa2-nx, banjo_renut_prefetch_next): the next item's data into the cache (its first lines).
++// sa2-nx (2026-10-20, sa2_renut_prefetch_next): the next item's data into the cache (its first lines).
+ inline void PrefetchItem(const Item &item) {
+   if (const auto *a = static_cast<const char *>(item.prefetch[0])) {
+     __builtin_prefetch(a);
+     __builtin_prefetch(a + 64);
+-    // sasrt-nx (2026-11-12, batch C/D, item C8; port 93): prefetch[0] is a draw's capture (QueuePrefetched's only
+-    // caller, QueueCapture): its call's second line (with its binding) and its stack headers' count (blur-nx's, port 76),
+-    // which the lambda reads first. (sasrt-nx's +320 and +384, its recorded surfaces' headers, are the stack headers'
+-    // own here, read only when the count is not 0: not fetched.)
++    // sasrt-nx (2026-11-12, batch C8): prefetch[0] is a draw's capture (QueuePrefetched's only caller): its call's
++    // second line and the surface headers / index buffer the lambda reads first.
+     __builtin_prefetch(a + 128);
+     __builtin_prefetch(a + 256);
++    __builtin_prefetch(a + 320);
++    __builtin_prefetch(a + 384);
+   }
+   if (const auto *b = static_cast<const char *>(item.prefetch[1])) {
+     __builtin_prefetch(b);
+     __builtin_prefetch(b + 64);
+     __builtin_prefetch(b + 128);
+     __builtin_prefetch(b + 192);
+-  }
+-}
++    // sasrt-nx (2026-11-20, sasrt_rt2_ring_prefetch; the second render-thread round's #30): a narrowed delta averages
++    // ~360 bytes in the 4-player race (6-7 lines): two lines more.
++    if (sasrt::gpu_round::On(sasrt::gpu_round::kRt2RingPrefetch)) {
++      __builtin_prefetch(b + 256);
++      __builtin_prefetch(b + 320);
++    }
++  }
++}
++
++// sasrt-nx (2026-11-10, the user's thread-latency list, items 6 and 7): the queue's two waits on an address. On
++// Horizon a condition variable's wake gives the woken thread the mutex before it runs: SlRenderer woken by "frame done"
++// held g_mutex while waiting for its core, and the render thread (0x2C) then blocked on g_mutex at its next queue take
++// behind it (the event fix's case, PosixCondition<Event>, in the SDK). Here a waiter sleeps on a counter
++// (svcWaitForAddress) and takes g_mutex only once it runs; a notify bumps the counter after the state it signals was
++// changed under g_mutex (every notify here), so a waiter that read the counter under g_mutex before sleeping cannot
++// miss it. sasrt_renut_queue_spin_us: a waiter first spins that long on the counter (item 7: no kernel sleep and wake
++// for a short wait). Off: std::condition_variable, as before.
++REXCVAR_DEFINE_BOOL(sasrt_renut_queue_address_wait, false, "SASRT/RenderThread",
++                    "The render thread's work queue and the game threads' waits on it (frames ahead, fences, drains) "
++                    "sleep on an address (svcWaitForAddress) instead of the mutex's condition variable: a woken thread "
++                    "takes the mutex only when it runs (the Switch; the PC as before)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_INT32(sasrt_renut_queue_spin_us, 0, "SASRT/RenderThread",
++                     "With sasrt_renut_queue_address_wait: a waiter spins this many microseconds on the queue's counter "
++                     "before it sleeps (0: sleeps at once)")
++    .range(0, 1000)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++#if defined(__SWITCH__)
++extern "C" bool RexSwitchWaitIfEqual(volatile uint32_t *word, uint32_t value, int64_t ns);
++extern "C" void RexSwitchWakeAddress(volatile uint32_t *word, int32_t count);
++#endif
++
++class QueueCond {
++ public:
++  void notify_one() {
++    if (AddressOn()) {
++      gen_.fetch_add(1, std::memory_order_release);
++      Wake(1);
++      return;
++    }
++    cv_.notify_one();
++  }
++  void notify_all() {
++    if (AddressOn()) {
++      gen_.fetch_add(1, std::memory_order_release);
++      Wake(-1);
++      return;
++    }
++    cv_.notify_all();
++  }
++  template <class Pred>
++  void wait(std::unique_lock<std::mutex> &lock, Pred pred) {
++    if (!AddressOn()) {
++      cv_.wait(lock, pred);
++      return;
++    }
++    while (!pred())
++      Sleep(lock, kNetNs);
++  }
++  template <class Rep, class Period, class Pred>
++  bool wait_for(std::unique_lock<std::mutex> &lock, std::chrono::duration<Rep, Period> d, Pred pred) {
++    if (!AddressOn())
++      return cv_.wait_for(lock, d, pred);
++    const auto deadline = std::chrono::steady_clock::now() + d;
++    while (!pred()) {
++      const auto now = std::chrono::steady_clock::now();
++      if (now >= deadline)
++        return pred();
++      Sleep(lock, std::min<int64_t>(kNetNs, std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count()));
++    }
++    return true;
++  }
++  template <class Rep, class Period>
++  void wait_for(std::unique_lock<std::mutex> &lock, std::chrono::duration<Rep, Period> d) {
++    if (!AddressOn()) {
++      cv_.wait_for(lock, d);
++      return;
++    }
++    Sleep(lock, std::min<int64_t>(kNetNs, std::chrono::duration_cast<std::chrono::nanoseconds>(d).count()));
++  }
++
++ private:
++  static constexpr int64_t kNetNs = 100'000'000;  // re-checked every 100 ms unwoken (a net)
++  static bool AddressOn() {
++#if defined(__SWITCH__)
++    static const bool on = REXCVAR_GET(sasrt_renut_queue_address_wait);
++    return on;
++#else
++    return false;
++#endif
++  }
++  void Wake(int32_t count) {
++#if defined(__SWITCH__)
++    RexSwitchWakeAddress(reinterpret_cast<volatile uint32_t *>(&gen_), count);
++#else
++    (void)count;
++#endif
++  }
++  // With 'lock' held: sleeps until the counter moves (or 'ns'), the lock released meanwhile; returns with it held.
++  void Sleep(std::unique_lock<std::mutex> &lock, int64_t ns) {
++    const uint32_t seen = gen_.load(std::memory_order_acquire);
++    lock.unlock();
++#if defined(__SWITCH__)
++    static const int32_t spin_us = REXCVAR_GET(sasrt_renut_queue_spin_us);
++    bool moved = false;
++    if (spin_us > 0) {
++      const auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
++      while (std::chrono::steady_clock::now() < end) {
++        if (gen_.load(std::memory_order_acquire) != seen) {
++          moved = true;
++          break;
++        }
++        __asm__ __volatile__("yield" ::: "memory");
++      }
++    }
++    if (!moved)
++      RexSwitchWaitIfEqual(reinterpret_cast<volatile uint32_t *>(&gen_), seen, ns);
++#else
++    (void)ns;
++#endif
++    lock.lock();
++  }
++  std::atomic<uint32_t> gen_{0};
++  std::condition_variable cv_;
++};
+ 
+ std::mutex g_mutex;
+-std::condition_variable g_work_cv;  // work queued, or stopping
++QueueCond g_work_cv;  // work queued, or stopping
+ // banjo-nx (banjo_renut_queue_notify_idle): the render thread is in g_work_cv.wait (under g_mutex). A push notifies only
+ // then: on the Switch every notify is a kernel call, about 1,500 a frame from the game threads, most of them while the
+ // render thread is busy and not waiting. The render thread reads the queue under g_mutex before it sleeps, so a push
+ // it has not seen is never missed.
+ bool g_render_waiting = false;
+-std::condition_variable g_done_cv;  // work done: frames, fences, drains; or stopped
+-// banjo-nx (2026-10-20, from sa2-nx, banjo_renut_done_notify_waiters): threads in g_done_cv's waits (under g_mutex). A done signal goes
++QueueCond g_done_cv;  // work done: frames, fences, drains; or stopped
++// sa2-nx (2026-10-20, sa2_renut_done_notify_waiters): threads in g_done_cv's waits (under g_mutex). A done signal goes
+ // only when there is one: a waiter checks its condition under g_mutex before it counts itself and sleeps, and the
+ // state it waits for changes under g_mutex too, so no signal it needs is skipped.
+ // blur-nx (2026-11-17, the Renut audit's #12): atomics (sequentially consistent), so the ring's batch end can count
+ // its items and read the waiters without g_mutex (blur_renut_done_lockfree, RunRing); every other access is still
+ // under g_mutex as before.
+ std::atomic<int> g_done_waiters{0};
+ bool DoneNotifyAll() {
+-  static const bool on = REXCVAR_GET(banjo_renut_done_notify_waiters);
++  static const bool on = REXCVAR_GET(sa2_renut_done_notify_waiters);
+   return !on;
+ }
+ // blur-nx (2026-11-17, the Renut audit's #11, blur_renut_render_address_wait; the Switch): the ring's sleep on an
+ // address instead of g_work_cv. The render thread reads g_wake_word, looks at the ring once more and sleeps while the
+@@ -344,16 +557,53 @@
+     if (batch_clock)
+       g_item_start = start;
+     size_t n = 0;
+     Clock::time_point item_start = start;
++    // sasrt-nx (2026-11-20, sasrt_rt4_ring_lock_once; the third table's #4): State().mutex held from one draw's item
++    // into the next when that one is published already and a draw's too (QueuePrefetched's: prefetch[0] is its capture),
++    // at most 8 in a row (the game thread's hooks that take the lock wait at most that long), and never past the run's
++    // end: a lock and an unlock fewer an item. Only draws: the place waits (which wait on the game thread, the deadlock
++    // proposal 19 met with every item) and every other item take it on their own as before. The closures still go after
++    // their item (under the lock when it is kept: a capture's memory, no lock of its own).
++    static const bool chain_lock = sasrt::gpu_round::On(sasrt::gpu_round::kRt4RingLockOnce);
++    bool held = false;
++    uint32_t held_items = 0;
+     do {
+       RingSlot &slot = g_ring[pos & (kRingSlots - 1)];
+-      if (prefetch && RingReady(pos + 1))
++      const bool next_ready = RingReady(pos + 1);
++      if (prefetch && next_ready)
+         PrefetchItem(g_ring[(pos + 1) & (kRingSlots - 1)].item);
+       if (!batch_clock)
+         g_item_start = item_start;
+-      Execute(slot.item);
+-      slot.item.work = nullptr;  // the closure's captures go now, as the batch's cleared vector freed them
++      if (chain_lock && slot.item.locked && slot.item.prefetch[0] &&
++          sasrt::gpu_round::On(sasrt::gpu_round::kRt4RingLockOnce)) {
++        if (!held) {
++          State().mutex.lock();
++          held = true;
++          held_items = 0;
++        } else {
++          sasrt::gpu_round::Count(sasrt::gpu_round::kRt4RingLockOnce);  // a lock and an unlock saved
++        }
++        {
++          ::renut::gpu::census::Scope census_scope(::renut::gpu::census::kRunItem);
++          slot.item.work();
++        }
++        ++held_items;
++        const Item *next = next_ready ? &g_ring[(pos + 1) & (kRingSlots - 1)].item : nullptr;
++        const bool keep = next && next->locked && next->prefetch[0] && held_items < 8 && n + 1 < kRingRun;
++        slot.item.work = nullptr;
++        if (!keep) {
++          State().mutex.unlock();
++          held = false;
++        }
++      } else {
++        if (held) {  // not expected (keep looked at this item), but never two holds
++          State().mutex.unlock();
++          held = false;
++        }
++        Execute(slot.item);
++        slot.item.work = nullptr;  // the closure's captures go now, as the batch's cleared vector freed them
++      }
+       slot.seq.store(pos + kRingSlots, std::memory_order_release);
+       ++pos;
+       g_dequeue.store(pos, std::memory_order_relaxed);
+       ++n;
+@@ -362,8 +612,10 @@
+         g_busy += end - item_start;
+         item_start = end;
+       }
+     } while (n < kRingRun && RingReady(pos));
++    if (held)  // sasrt-nx (2026-11-20, sasrt_rt4_ring_lock_once): never kept past the run
++      State().mutex.unlock();
+     if (batch_clock)
+       g_busy += Clock::now() - start;
+     bool wake;
+     // blur-nx (2026-11-17, the Renut audit's #12, blur_renut_done_lockfree): the count added and the waiters read
+--- base/app/src/renut_engine/gpu/sasrt_gpu_round.h
++++ sasrt-nx/app/src/renut_engine/gpu/sasrt_gpu_round.h
+@@ -63,32 +63,100 @@
+   X(kHandoverSmaa, sasrt_gpu_handover_with_smaa, "banjo's colour hand-over kept on with SMAA (SMAA's target settled first)") \
+   X(kExportWindowUbo, sasrt_gpu_export_window_ubo, "memexport windows read from the constant buffer, not a local array (constant 944)") \
+   X(kExportListTopology, sasrt_gpu_export_list_topology, "export draws with the rasterizer off drawn as triangle or line lists, not points") \
+   X(kExportNoPointGs, sasrt_gpu_export_no_point_gs, "export point lists with the rasterizer off drawn without the point-sprite geometry shader") \
+-  /* the fifth round (2026-11-09, docs/gpu-round-1108.md "Round 5"): A/B 139 and up */                                     \
+-  X(kRestoreDirect, sasrt_gpu_depth_restore_direct, "SASRT only: the EDRAM depth restore in one pass") \
++  /* the fifth round (2026-11-09: A393B1E0, docs/gpu-round-1108.md "Round 5"): A/B 139 and up */                         \
++  X(kRestoreDirect, sasrt_gpu_depth_restore_direct, "the EDRAM depth restore drawn from the depth resolve, its colour copy left out") \
+   X(kRestoreClear, sasrt_gpu_depth_restore_whole_clear, "the depth restore clears depth and stencil together when it draws the whole target") \
+   X(kFetchConvSpec, sasrt_gpu_fetch_conversion_spec, "a non-plain fetch's sign, gamma and exponent words as constants of the draw (950-957)") \
+   X(kFetchExpSpec, sasrt_gpu_fetch_exp_3d_spec, "a 3D or cube fetch's exponent adjust as a constant of the draw (958-973)") \
+-  X(kConvertVertexPass, sasrt_gpu_convert_vertex_pass, "exported stream conversions drawn as a vertex pass (flat: off)") \
+-  /* sasrt-nx's render-thread round (2026-11-09; port 54): A/B 144 and up, and 200 for the group (kAbRtGroup) */          \
++  X(kConvertVertexPass, sasrt_gpu_convert_vertex_pass, "exported stream conversions drawn as a vertex pass on the 3D engine, not dispatched") \
++  /* pixel-changing cuts (2026-11-09, the user: "non-pixel identical GPU cuts as well, I'll determine what stays"): off */ \
++  X(kCutDepthAlias, sasrt_gpu_cut_depth_alias, "CHANGES PIXELS: the light and composite passes test against the G-buffer's own depth, no restore") \
++  X(kCutCopyDrop, sasrt_gpu_cut_restore_copy_drop, "CHANGES PIXELS (where the G-buffer leaves pixels): a restore copy left out is never drawn") \
++  X(kCutMipNearest, sasrt_gpu_cut_mip_nearest, "CHANGES PIXELS: the game's trilinear textures sampled bilinear (the nearer mip level)") \
++  X(kCutLodBias, sasrt_gpu_cut_lod_bias, "CHANGES PIXELS: the game's mipmapped textures sampled half a level smaller") \
++  X(kCutShadowScale, sasrt_gpu_cut_shadow_two_thirds, "CHANGES PIXELS: the shadow maps at two thirds of their size (made so: no in-run A/B)") \
++  X(kShadowUncompressed, sasrt_gpu_shadow_uncompressed, "shadow-map depth targets without hardware compression: no decompression before their resolves (made so: no in-run A/B)") \
++  X(kRestoreReuse, sasrt_gpu_depth_restore_reuse, "a depth restore of the same resolve as an earlier one, whose depth is unchanged: that target, its stencil cleared") \
++  X(kCutTakeOnOverwrite, sasrt_gpu_cut_take_on_overwrite, "CHANGES PIXELS if a post pass leaves a pixel: a handed resolve keeps the image a full-screen post draw overwrites") \
++  X(kCutGatherPcf, sasrt_gpu_cut_gather_pcf, "MAY CHANGE PIXELS at texel edges: four point taps half a texel around one place read by one gather (976)") \
++  X(kRestoreClearSkip, sasrt_gpu_depth_restore_clear_skip, "the direct depth restore clears to the scene's clear depth and leaves the pixels at it as cleared") \
++  X(kCutSsaoOff, sasrt_gpu_cut_ssao_off, "CHANGES PIXELS: no ambient occlusion: the SSAO pass's draw is a clear to white (no occlusion)") \
++  X(kCutPcfHalf, sasrt_gpu_cut_pcf_half, "CHANGES PIXELS: the scene's shadow filter (9041AFF6) averages 4 of its 8 bilinear PCF places (977)") \
++  X(kCutNoAa, sasrt_gpu_cut_no_aa, "CHANGES PIXELS: no anti-aliasing: SMAA not run (the game's FXAA pass stays its centre sample)") \
++  X(kCutShadowAlphaCasters, sasrt_gpu_cut_shadow_alpha_casters, "CHANGES PIXELS: the shadow maps' alpha-tested casters (3ECDED03: foliage, fences) not drawn") \
++  X(kShadowD32f, sasrt_gpu_shadow_d32f, "shadow-map depth targets as D32F (no stencil plane: the casters use none): half the bytes") \
++  X(kSkipCopyBack, sasrt_gpu_skip_copy_back, "a post copy of a resolve back into the same unchanged target it came from is not drawn") \
++  X(kCutFarCascade, sasrt_gpu_cut_far_cascade, "CHANGES PIXELS: the far shadow cascade's casters not drawn (no shadows in its range)") \
++  X(kCutFarCascadeHalf, sasrt_gpu_cut_far_cascade_half_rate, "CHANGES PIXELS: the far shadow cascade drawn every other frame (the atlas keeps the last one)") \
++  X(kCutBloomOff, sasrt_gpu_cut_bloom_off, "CHANGES PIXELS: no bloom: the bloom chain's passes are clears to black") \
++  X(kCutSmaaLow, sasrt_gpu_cut_smaa_low, "CHANGES PIXELS: SMAA's low preset edge threshold (0.15 instead of 0.1): fewer edges smoothed") \
++  X(kCutSsaoHalfRate, sasrt_gpu_cut_ssao_half_rate, "CHANGES PIXELS: SSAO and its blur every other frame (the composite reads the last result)") \
++  X(kCutShadowsOff, sasrt_gpu_cut_shadows_off, "CHANGES PIXELS: no shadows: no caster drawn into any shadow map (the maps stay cleared: lit)") \
++  X(kCutPointLightsOff, sasrt_gpu_cut_point_lights_off, "CHANGES PIXELS: no point lights: the light pass's draws after the sun's (their stencil volumes too) not drawn") \
++  X(kShadowAtlasDirect, sasrt_gpu_shadow_atlas_direct, "the shadow cascades drawn straight into their slices of the atlas (D32F images over its memory): no resolve copies") \
++  X(kCutAmbientSky, sasrt_gpu_cut_ambient_sky, "CHANGES PIXELS (the sky, unless a later pass replaces it): the additive ambient pass ED0A8D53 not shaded where the restored depth is the clear (depth bounds)") \
++  /* the render-thread round (2026-11-09, the user: "15 or so render thread optimisations"; docs/render-thread-round-1109.md): A/B 169 and up */ \
+   X(kRtRestoreCandidates, sasrt_rt_restore_candidates, "render thread: a depth target's EDRAM-restore source found among its own few candidate colour targets, kept until a target is built or retired, not by two scans of every target a draw") \
+-  X(kRtCachedExportSeeds, sasrt_rt_cached_export_seeds, "render thread: the memexport windows' buffer CPU-cached, so the CPU writes the seeds at cache speed and cleans their lines (chosen at start: no in-run A/B)")
++  X(kRtWordsOwnerMemo, sasrt_rt_words_owner_memo, "render thread: the texture owning a depth-words view slot (the restore copy's) remembered and checked, not found by a scan of every texture") \
++  X(kRtViewSurfaceMemo, sasrt_rt_view_surface_memo, "render thread: a replayed op's colour EDRAM view looked up through the surface memo too (keyed by its view words), not by the slow lookup every time") \
++  X(kRtCachedExportSeeds, sasrt_rt_cached_export_seeds, "render thread: the memexport windows' buffer CPU-cached, so the CPU writes the seeds at cache speed and cleans their lines (chosen at start: no in-run A/B)") \
++  /* the second render-thread round (2026-11-20, the user: "35 ideas ... to make the render thread cheaper"; docs/render-thread-ideas-1120.md): A/B 339 and up, all at once 401 */ \
++  X(kRt2SlotIndex, sasrt_rt2_slot_index, "render thread: FindHostTextureBySlotLocked's memo a 256-entry table by slot (each answer checked as before), not one entry") \
++  X(kRt2SpecMemo, sasrt_rt2_spec_memo, "render thread: a fast draw's fetch-spec, plain-fetch, clip and spec words kept from the draw before when no shared-constant line, shader, target or A/B half changed") \
++  X(kRt2DropThrottle, sasrt_rt2_drop_throttle, "render thread: DropReplacedRanges' pass over the stream cache's limit every 4th frame, not every frame (memory only)") \
++  X(kRt2PagesTail, sasrt_rt2_pages_tail, "render thread: PagesClean's last 1-7 pages of a range in one masked NEON block when none of their cards is written") \
++  X(kRt2ColorAliasMemo, sasrt_rt2_color_alias_memo, "render thread: ColorAliasesLocked's answer kept per surface until a target is made or retired") \
++  X(kRt2RepeatRecordedIndex, sasrt_rt2_repeat_recorded_index, "render thread: WholeRepeatHit reads the replay's recorded index buffer, as WholeGeometryTry does (a correctness fix too)") \
++  X(kRt2HeldExportBitmap, sasrt_rt2_held_export_bitmap, "render thread: GetStreamSource looks up the kept exports only where a 64 KB granule bitmap says one may lie") \
++  X(kRt2PlaceWaitFree, sasrt_rt2_place_wait_unlocked, "render thread: a same-frame place's wait without State().mutex held (spin, then a timed wait)") \
++  X(kRt2RingPrefetch, sasrt_rt2_ring_prefetch, "render thread: the next ring item's narrowed device delta prefetched to six lines, not four") \
++  X(kRt2ReadableMemo, sasrt_rt2_readable_memo, "render thread: the vertex fills' guest readability answers kept while no page has lost read access (no heap mutex, no page walk)") \
++  X(kRt2BindLayoutNarrow, sasrt_rt2_bind_layout_narrow, "render thread: a layout change elsewhere binds the fast draw's targets again only when its own targets are not in their bind layouts") \
++  X(kRt2TextureMemoTwoWay, sasrt_rt2_texture_memo_two_way, "render thread: the texture slot memo two-way (2,048 sets of two), the way of an earlier frame replaced") \
++  X(kRt2RepeatRing, sasrt_rt2_repeat_ring, "render thread: WholeGeometryTry's repeat answer kept for the last four meshes of a kick, not one") \
++  /* the third render-thread round (2026-11-20, the user: "Come up with 35 more ... Do a 35 batch"; docs/render-thread-ideas-1120.md): all at once 402 */ \
++  X(kRt3WordsOwnerTable, sasrt_rt3_words_owner_table, "render thread: the depth-words view owner a 256-entry table by slot, not one entry") \
++  X(kRt3SurfaceMemo256, sasrt_rt3_surface_memo_256, "render thread: GetHostSurfaceLocked's memo 256 entries, not 64") \
++  X(kRt3DepthBiasFields, sasrt_rt3_depth_bias_fields, "render thread: the fast draw's depth bias not set again when its packets are unchanged since the draw before") \
++  X(kRt3PlaceSpin, sasrt_rt3_place_spin, "render thread: a same-frame place's wait spins on the slot's flag first (sasrt_rt3_place_spin_us), then sleeps") \
++  X(kRt3HostPacketsSplit, sasrt_rt3_host_packets_split, "render thread: host packets (banjo_renut_host_packets) while the screen is split, whatever the key") \
++  /* the fourth render-thread round (2026-11-20, the user: "do these please and then do a massive ab of render thread stuff"; the third table's items left; docs/render-thread-ideas-1120.md): all at once 403 */ \
++  X(kRt4PushRunsMerged, sasrt_rt4_push_runs_merged, "render thread: two runs of pushed constant groups with one or two groups between them pushed as one run (the gap's current device bytes too; never over a literal register)") \
++  X(kRt4StateIdCrc, sasrt_rt4_state_id_crc, "render thread: RenderStateIdLocked's table index by CRC32C of the words (14 crc32cx), not 27 dependent multiplies") \
++  X(kRt4PipelineFourWay, sasrt_rt4_pipeline_four_way, "render thread: the fast pipeline cache four-way (the index's aligned group of four), not two") \
++  X(kRt4SpecKeySkip, sasrt_rt4_spec_key_skip, "render thread: a fast draw with the spec memo's answers skips comparing them with the kept key when it was checked against them and no key was written since") \
++  X(kRt4StreamMemoTwoWay, sasrt_rt4_stream_memo_two_way, "render thread: the stream and index caches' memos two-way (a slot and its pair, the most recent first), not direct-mapped") \
++  X(kRt4RingLockOnce, sasrt_rt4_ring_lock_once, "render thread: State().mutex kept from one draw item into the next published draw item (at most 8 in a row), not taken and let go at each") \
++  X(kRt4InertKeepsChain, sasrt_rt4_inert_keeps_chain, "render thread: a draw left out as inert or culled both ways keeps the fast path's chain (its changed fields carried into the next draw)") \
++  X(kRt4ExportReadsFast, sasrt_rt4_export_reads_fast, "render thread: a draw whose only memexport reads are host-layout vertex streams found on the GPU stays on the fast path (the streams converted there as the full path does)")
++
++#define SASRT_GPU_ROUND_RT2_FIRST kRt2SlotIndex
++#define SASRT_GPU_ROUND_RT3_FIRST kRt3WordsOwnerTable
++#define SASRT_GPU_ROUND_RT4_FIRST kRt4PushRunsMerged
+ 
+ enum Item : int {
+ #define SASRT_GPU_ROUND_ENUM(name, key, what) name,
+   SASRT_GPU_ROUND_ITEMS(SASRT_GPU_ROUND_ENUM)
+ #undef SASRT_GPU_ROUND_ENUM
+   kCount
+ };
+ 
+-constexpr int kAbBase = 90;
+-// sasrt-nx (2026-11-09, the render-thread round; port 54): A/B target 200 switches every render-thread item (from
+-// kRtRestoreCandidates on) at once: the round's total, best with banjo_renut_ab_s 30 (4 s halves cannot resolve 1-3 ms
+-// of render thread).
+-constexpr int kAbRtGroup = 200;
+-static_assert(kCount <= 64, "plume's Deko3DStats::sasrtRound has 64 counts");
+-static_assert(kAbBase + kCount <= 256, "banjo_renut_ab_targets takes targets up to 255");
++// sasrt-nx (2026-11-19, base port 188): this port's own A/B numbers are 256 and up (the base keeps 1-255 and
++// never takes a number from 256 on); 90-172 before, which met the base's 150-156 and its 240.
++constexpr int kAbBase = 256;
++// sasrt-nx (2026-11-09, the render-thread round): A/B target 200 switches every render-thread item (from
++// kRtRestoreCandidates on) at once: the round's total, with banjo_renut_ab_s 30 (the user's 30 s halves).
++constexpr int kAbRtGroup = 400;  // 200 before 2026-11-19 (port 188)
++// sasrt-nx (2026-11-20): A/B target 401 switches the second render-thread round's items (from kRt2SlotIndex on) at once.
++constexpr int kAbRt2Group = 401;
++// sasrt-nx (2026-11-20): A/B target 402 switches the third render-thread round's items (from SASRT_GPU_ROUND_RT3_FIRST on).
++constexpr int kAbRt3Group = 402;
++// sasrt-nx (2026-11-20): A/B target 403 switches the fourth render-thread round's items (from SASRT_GPU_ROUND_RT4_FIRST on).
++constexpr int kAbRt4Group = 403;
++static_assert(kCount <= 128, "plume's Deko3DStats::sasrtRound has 128 counts");
++static_assert(kAbBase + kCount <= kAbRtGroup && kAbRt4Group < 512, "banjo_renut_ab_targets takes targets up to 511");
+ 
+ struct Latched {
+   bool on[kCount] = {};
+ };
+--- base/app/src/renut_engine/gpu/sasrt_gpu_round.cpp
++++ sasrt-nx/app/src/renut_engine/gpu/sasrt_gpu_round.cpp
+@@ -509,65 +500,359 @@
+                     "target; any texture still sharing that target's image is settled (its resolve drawn) before SMAA "
+                     "writes it, so the hand-over stays on with SMAA. Every texel is the one the copy would write: same "
+                     "pixels")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+-// sasrt-nx's fifth GPU round (2026-11-09; rr6-nx's port of its pixel-identical items). Items 49 and 53 have no code
+-// here (49 is SASRT's own restore copy, A393B1E0; 53 is flat on its console): placeholders, so the A/B numbers stay
+-// SASRT's (139-143). Item 50 since port 52 (the base's EDRAM depth restore, port 29, for any game).
+-REXCVAR_DEFINE_BOOL(sasrt_gpu_depth_restore_direct, false, "SASRT/GPU", "SASRT only (fifth GPU round, item 49, A/B 139)")
+-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++// sasrt-nx (2026-11-09): the fifth GPU round (the user: "A393B1E0, I'm sure we can make it much more efficient"). A/B 139
++// and up.
++REXCVAR_DEFINE_BOOL(sasrt_gpu_depth_restore_direct, true, "SASRT/GPU",
++                    "deko3d renderer (fifth GPU round, item 49, A/B 139): SASRT restores its scene depth twice a frame "
++                    "(for the light pass and the composite) by drawing the depth resolve's words as colour (A393B1E0: "
++                    "1200x544, the 40-pixel halves of each EDRAM tile column swapped) into the EDRAM where the depth then "
++                    "sits; Renut then turns that colour back into depth (sasrt_renut_depth_restore): two full-screen passes. "
++                    "With this key the copy draw is left out and the restore computes in one pass what the two give a "
++                    "pixel (depth_restore_direct.hlsli: the copy's own words view, sampler, size and coordinates at the "
++                    "pixel the restore reads, the bytes as the RGBA8 target stores them, the restore's decode). The colour "
++                    "target is drawn (restore_copy_ps) before anything else uses it. Console run I (2026-11-09): the "
++                    "restored depth equal to the old chain's on every texel (sasrt_gpu_diag_restore_verify: 118 restores, "
++                    "74 M texels, 0 differ); in-run A/B -1.35 ms. (The first form read the resolve's float: 60 % of texels "
++                    "differed, the copy's point samples at texel corners.)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_BOOL(sasrt_gpu_depth_restore_whole_clear, true, "SASRT/GPU",
+-                    "Renut's renderer (fifth GPU round, item 50, A/B 140; port 52): the EDRAM depth restore "
+-                    "(sasrt_renut_depth_restore) cleared the stencil alone (depth kept) before drawing every pixel's depth "
+-                    "with the test off: a stencil-only clear keeps the depth, so it cannot be a fast clear. When the "
+-                    "restore's rectangle is the whole depth target, depth and stencil are cleared together (the depth to "
+-                    "0, then every pixel drawn over it, as before): the same depth and stencil 0 in every pixel")
++                    "deko3d renderer (fifth GPU round, item 50, A/B 140): the EDRAM depth restore cleared the stencil alone "
++                    "(depth kept) before drawing every pixel's depth with the test off: a stencil-only clear keeps the depth, "
++                    "so it cannot be a fast clear. When the restore's rectangle is the whole depth target, depth and stencil "
++                    "are cleared together (the depth to 0, then every pixel drawn over it, as before): the same depth and "
++                    "stencil 0 in every pixel")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++// sasrt-nx (2026-11-09): the fifth round's cuts that change pixels (the user decides which stay); never for RR6's base.
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_depth_alias, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 54, A/B 144): the EDRAM depth restore (the light pass's and the "
++                    "composite's depth: the G-buffer's depth resolve quantised to the game's 24 bits, stencil 0) is not "
++                    "drawn: those passes bind the G-buffer's own depth target (its depth unchanged since that resolve, "
++                    "float, not quantised) with its stencil cleared to 0. Saves the restore draws (~1.8 ms a race frame) "
++                    "and, with item 49, nothing reads the copies. Depth tests at a light volume's edge can differ in the "
++                    "last bit of 24")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_restore_copy_drop, false, "SASRT/GPU",
++                    "CHANGES PIXELS where the G-buffer does not draw (fifth GPU round, item 55, A/B 145): with item 49, a "
++                    "restore copy left out is dropped when its target (the G-buffer's colour targets 1 and 2) is next "
++                    "bound, not drawn first: the G-buffer draws over it. Saves the two copies (~0.63 ms a race frame). "
++                    "Pixels the G-buffer leaves keep the last frame's G-buffer values instead of the depth words")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_mip_nearest, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 56, A/B 146): the game's textures that filter between mip levels "
++                    "(trilinear) sample the nearer level only (bilinear): half the texel reads a sample; the step between "
++                    "levels can show on surfaces at a slant. Render targets' host levels keep theirs")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_lod_bias, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 57, A/B 147): the game's mipmapped textures sampled with half a "
++                    "level more LOD bias (smaller levels: fewer texels read, blurrier at a distance)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_shadow_two_thirds, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 58): SASRT's shadow maps (square 512-2048 depth targets: the "
++                    "three 1024x1024 cascades resolved into the 1024x3072 atlas) rendered at two thirds of their size "
++                    "(render scale code 1, as Renut's 480p): 0.44 of the shadow fill and of the depth resolves; softer, "
++                    "blockier shadow edges. Decided when a target is made: no in-run A/B (compare runs)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_shadow_uncompressed, false, "SASRT/GPU",
++                    "deko3d renderer (fifth GPU round, item 59): SASRT's shadow-map depth targets (square 512-2048) made "
++                    "without hardware compression: each cascade is drawn, then resolved into the atlas, and a compressed "
++                    "depth target is decompressed (a full pass over it) before every read; uncompressed it is read as it "
++                    "is. Lossless either way: the same depth, the same pixels. Its draws write more bytes. Decided when a "
++                    "target is made: no in-run A/B (compare runs)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_depth_restore_reuse, true, "SASRT/GPU",
++                    "deko3d renderer (fifth GPU round, item 60, A/B 150): SASRT restores the same depth resolve twice a "
++                    "frame (the light pass's depth, then the composite's: the same 24-bit values, stencil 0), and the "
++                    "light pass writes only stencil. The second restore binds the first one's target instead, its stencil "
++                    "cleared to 0 (the restore's): the same depth bits and stencil, one full-screen depth write less "
++                    "(~0.9 ms). Checked: same resolve (texture, resolves count, signature), that target's depth plane "
++                    "not written since its restore, the same format, size and scale")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_take_on_overwrite, false, "SASRT/GPU",
++                    "CHANGES PIXELS only if a post pass does not cover its target (fifth GPU round, item 61, A/B 151; needs "
++                    "sasrt_gpu_handover_with_smaa): banjo's colour hand-over leaves a resolve in its target's image, and "
++                    "the next draw into the target copies it out first (the post chain draws, resolves, and draws into "
++                    "the same 1152x544 RGBA16F target again: ~0.74 ms a copy). When that draw is one of SASRT's post "
++                    "passes (a listed pixel shader with no discard of its own: no alpha test, no blending, every channel, "
++                    "a full-screen quad or grid within a scissor covering the target), the texture keeps the image and the "
++                    "target takes another (as a whole clear does): the draw writes every pixel of it anyway")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_gather_pcf, false, "SASRT/GPU",
++                    "MAY CHANGE PIXELS at exact texel edges (fifth GPU round, item 62, A/B 152): a pixel shader's four "
++                    "fetches of one texture at the same place offset by (+-0.5, +-0.5) texels (the game's shadow filter "
++                    "9041AFF6: 8 such groups, 32 fetches of the shadow atlas) through a point sampler read the 2x2 block "
++                    "a gather at that place reads: one textureGather instead (constant 978, pass gatherpcf; bit r: fetch "
++                    "constant r's sampler is point). The texels picked can differ where a coordinate falls on a texel "
++                    "edge (the rounding of the two paths)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_depth_restore_clear_skip, true, "SASRT/GPU",
++                    "deko3d renderer (fifth GPU round, item 63, A/B 153; with items 49 and 50): the direct depth restore "
++                    "clears the depth to the G-buffer's own clear depth (when that is known and exact in 24 bits: 0 or 1) "
++                    "instead of 0, and its shader discards the pixels whose restored depth is that value (the pixels no "
++                    "draw covered, the sky): they keep the fast clear, the same depth. Fewer depth writes, and those tiles "
++                    "stay compressed for the light pass's depth tests")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_ssao_off, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 64, A/B 154): the game's screen-space ambient occlusion "
++                    "(pixel shader 92D1F7E40EBB8E86: 8 sample spheres at 576x272, ~0.8 ms a race frame) is not drawn: its "
++                    "target is cleared to white instead, the shader's own value for no occlusion (1 - occlusion, alpha 1); "
++                    "the blur after it (137003414D593F33) then gives white too. Corners and contacts lose their darkening")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_pcf_half, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 65, A/B 155): the scene's shadow filter (pixel shader "
++                    "9041AFF62011FC58, ~2 ms a race frame) reads the shadow map at 8 places around the pixel (a rotated "
++                    "disc), each a bilinear PCF of 4 taps (32 fetches), and averages the 8: with this cut it averages 4 of "
++                    "them (one of each pair the shader builds together), so the other 16 fetches go (constant 979, pass "
++                    "pcfhalf). Shadow edges get coarser / noisier; fully lit and fully shadowed pixels stay the same")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_no_aa, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 66, A/B 156): no anti-aliasing: banjo's SMAA (edges, weights "
++                    "and blend, ~1.4 ms a race frame) is not run after the composite; with sasrt_smaa_replaces_fxaa the "
++                    "game's FXAA pass stays a copy of its centre sample, so edges are left aliased")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_shadow_alpha_casters, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 67, A/B 157): the shadow maps' alpha-tested casters (pixel "
++                    "shader 3ECDED036BF3FFC0 into a square depth target: foliage, fences, crowds; ~0.65 ms a race frame "
++                    "of pixel work plus their vertices) are not drawn: those objects cast no shadow")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_shadow_d32f, true, "SASRT/GPU",
++                    "deko3d renderer (fifth GPU round, item 68; the round-2 experiment sasrt_gpu_exp_shadow_d32f made an "
++                    "item): SASRT's depth is the 20e4 float format, so every depth target is Maxwell's ZF32_X24S8, 8 bytes "
++                    "a pixel. The shadow maps (square 512-2048 depth targets: three 1024x1024 cascades a frame) use no "
++                    "stencil (their draws' and clears' depth controls have it off), so they are made D32F: the same 32-bit "
++                    "float depth in half the bytes for the casters' depth writes, the decompression and the resolves into "
++                    "the atlas. A draw or clear that does use stencil on one is logged ([sasrt] stencil on a depth target "
++                    "without stencil). Decided when a target is made: no in-run A/B (compare runs)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_skip_copy_back, true, "SASRT/GPU",
++                    "deko3d renderer (fifth GPU round, item 69, A/B 159; console run O: sasrt_gpu_diag_copy_back_verify "
++                    "drew 5050 of them anyway and compared the target with the texture after: 3.16 G texels, 0 differ). "
++                    "SASRT's post chain draws full-screen copies (pixel shaders 50544D63 and "
++                    "BA4853E3: one fetch, written out) into its 1152x544 target. When the copy's texture is a whole resolve "
++                    "of that same target and the target has not been written since, the copy writes what the target "
++                    "already holds: the draw is left out (and a later resolve of the unchanged target into the same "
++                    "texture is skipped as before, banjo_renut_resolve_skip)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_far_cascade, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 70, A/B 160): SASRT draws three 1024x1024 shadow cascades a "
++                    "frame and resolves them into a 1024x3072 atlas (y 0, 1024, 2048). The third (the far one) is not "
++                    "drawn: its casters are left out (memory-export draws still run), so its resolve copies the cleared "
++                    "map: nothing in the far cascade's range is shadowed")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_far_cascade_half_rate, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 71, A/B 161): the far shadow cascade (see item 70) drawn and "
++                    "resolved every other frame; on the others its casters are left out and its resolve too, so the atlas "
++                    "keeps the frame before's: far shadows move at half the frame rate")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_bloom_off, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 72, A/B 162): no bloom (the glow around bright things): the "
++                    "bloom chain's 160x68 blurs (0EFBCCD0, 4404297A, 8C086C29, whose result B5642CA8 the composite "
++                    "2414CA96 adds; ~0.3 ms a race frame with their resolves) are each a clear of their target to black. "
++                    "The 288x136 bright pass stays: the luminance chain (the exposure the CPU reads) starts from it too "
++                    "(the post-chain map, run O)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_smaa_low, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 73, A/B 163): banjo's SMAA finds edges with SMAA's low preset "
++                    "threshold (luma step 0.15 instead of banjo_renut_smaa_threshold's 0.1): fewer pixels are edges, so "
++                    "the weights and blending passes do less; softer steps between similar colours stay aliased")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_ssao_half_rate, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 74, A/B 164): the SSAO pass (92D1F7E4, 576x272) and its blur "
++                    "(13700341) drawn every other frame; on the others both draws and their resolves into the textures "
++                    "the composite reads are left out, so the composite uses the frame before's ambient occlusion (~1 ms "
++                    "of half-resolution work every other frame; AO lags a frame on moving things)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_shadows_off, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 75, A/B 165): no shadows: no caster is drawn into any shadow map "
++                    "(square 512-2048 depth targets; memory-export draws still run). The maps keep their clear, so the "
++                    "atlas the light pass reads says lit everywhere: the shadow pass (~2.3 ms a race frame) goes; the "
++                    "light pass's shadow filter still runs")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_point_lights_off, false, "SASRT/GPU",
++                    "CHANGES PIXELS (fifth GPU round, item 76, A/B 166): no point lights. SASRT's light pass draws the sun "
++                    "(a stencil volume, then 9041AFF6 with its shadows) and then each point light as two stencil-volume "
++                    "draws (vertex shader 98B53A18, no pixel shader) and a light draw (C8053B63, 14C81445, 40BB8EDF, "
++                    "453EF879 in the race). The draws into the light target after the sun's are left out until the "
++                    "targets change: lamps, glows and the like stop lighting the scene; the sun and the ambient stay")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_shadow_atlas_direct, false, "SASRT/GPU",
++                    "deko3d renderer (fifth GPU round, item 77, A/B 167; with item 68): SASRT draws its three shadow "
++                    "cascades into one 1024x1024 depth target and resolves each into a slice of a 1024x3072 atlas (y 0, "
++                    "1024, 2048): three full copies a frame (~2.1 ms on the console, run U). The atlas is made without "
++                    "compression and three D32F depth images are made over its memory, one a slice (the same block-linear "
++                    "rows: 128-row tiles, 4 MB a slice); at each cascade's whole clear the target takes the next slice's "
++                    "image (the order learnt from the resolves), so the cascade is drawn where the resolve would have "
++                    "copied it and the resolve is left out (a barrier for the reads instead). Where the order differs the "
++                    "resolve copies as before. The atlas texels are the depth's float bits either way "
++                    "(sasrt_gpu_diag_atlas_verify checks it on the GPU). The shadow maps' depth is then uncompressed "
++                    "(item 59's cost, +0.6 ms). Off: slower on the console (run W, +0.45 ms: the casters' uncompressed depth "
++                    "and the in-place cascades' barriers give back the copies saved)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt_restore_candidates, true, "SASRT/RenderThread",
++                    "Render thread (render-thread round, RT1, A/B 169): the EDRAM depth restore asks, for every draw with a "
++                    "depth target bound whose surfaces were written since (the fast path's check; nearly every draw), which "
++                    "RGBA8 colour target over the same EDRAM base and pitch was written after the depth "
++                    "(DepthRestoreSourceLocked). That scanned the whole target table twice (to find the depth's own key, "
++                    "then every target; ~2.6 % of the render thread in the race, run X). With this key each depth target "
++                    "keeps its own few candidates (same base and pitch, colour, one sample, its scale, RGBA8 or BGRA8), "
++                    "found again only when a target is built or retired (an epoch of its own): the same answer from the "
++                    "same write sequences")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt_words_owner_memo, true, "SASRT/RenderThread",
++                    "Render thread (render-thread round, RT2, A/B 170): the EDRAM restore copy (A393B1E0, two draws a race "
++                    "frame) asks which texture owns the depth-words view its fetch 0 binds (SasrtWordsViewOwnerLocked), "
++                    "which scanned every texture's words views (~0.75 % of the render thread in run X: the race has "
++                    "thousands of textures). With this key the last answer is kept (the slot and the texture's address) "
++                    "and checked first: the texture is looked up by its address and must still hold a words view with "
++                    "that slot (a descriptor slot belongs to one view at a time), so the answer is the scan's")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt_view_surface_memo, false, "SASRT/RenderThread",
++                    "Render thread (render-thread round, RT3, A/B 171): a replayed op's surface bound through an EDRAM "
++                    "view (SetSurfaceViewLocked: the destination packet's base and pitch; this game renders its post chain "
++                    "at EDRAM base 0 through views) skipped banjo-nx's 64-entry surface memo ('the memo knows no EDRAM "
++                    "base') and took GetHostSurfaceSlow every time (~2 % of the render thread with SurfaceRenderScale). "
++                    "With this key a colour view is memoised too, keyed by the view's own words (size, surface info, "
++                    "format and colour info: the EDRAM base) and marked as a view (a view entry answers only a view "
++                    "lookup), in a slot of its own (the VA and the view words hashed). For a target that exists the slow "
++                    "path's only effects are the four header words, which a hit sets the same; the surface epoch (targets "
++                    "built, re-pointed or retired, the render scale) clears the memo as for the other entries. Depth views "
++                    "are left to the slow path (banjo_deko3d_depth24's format can change at a later sighting)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt_cached_export_seeds, true, "SASRT/RenderThread",
++                    "Render thread (render-thread round, RT5; chosen at start, so no in-run A/B: target 172 does nothing): "
++                    "the CPU writes each fresh memexport window's seed (its guest bytes, item 30: ~12 MB a second in the "
++                    "race) into the slot's export buffer, which was CPU-uncached memory: memcpy's bulk loop at uncached "
++                    "speed was ~2 % of the render thread (run P1's lines). With this key the buffer is CPU-cached (plume: "
++                    "an upload buffer with HOST_CACHED, flushed at creation so no older dirty line can land on the GPU's "
++                    "results) and each seed's lines are cleaned (dc cvac) right after it is written, before anything is "
++                    "submitted. The windows start on 256-byte boundaries, so no line holds two windows; every line a seed "
++                    "touches is wholly its own (its last one's padding is no window's): the GPU sees the same bytes. The "
++                    "CPU never reads the buffer (readbacks go through a GPU copy)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt2_slot_index, true, "SASRT/RenderThread",
++                    "Render thread (second round, 2026-11-20; docs/render-thread-ideas-1120.md): FindHostTextureBySlotLocked (the copy-back checks of the post passes, about 13 a frame in the 4-player race, each a walk of every texture: 3.4 % of the render thread in rex_profile_307) remembers an answer per slot in a 256-entry table, each checked by the fields the walk tests (a slot has one live owner), instead of one last answer")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt2_spec_memo, true, "SASRT/RenderThread",
++                    "Render thread (second round, 2026-11-20; docs/render-thread-ideas-1120.md): A fast draw's FetchSpecWords, SasrtPlainFetchMask, SasrtClipBit and SasrtSpecWordsOf are the draw before's when none of the shared constants' lines was written since (g_sc_dirty, which the push trusts too), the shaders, the vertex shader's record, the targets and their colour words, the instancing and the A/B half are the same, and the vertex shader exports nothing (its words read its float constants)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt2_drop_throttle, true, "SASRT/RenderThread",
++                    "Render thread (second round, 2026-11-20; docs/render-thread-ideas-1120.md): DropReplacedRanges' pass while the stream cache is over its limit every 4th frame, not every frame (kameo-nx's rule for 3 fps; the 4-player race sat at 135.7 MB of 128 and walked both caches every frame, and a whole entry among the drops staled every mesh object). Memory only: what a draw reads does not change")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt2_pages_tail, true, "SASRT/RenderThread",
++                    "Render thread (second round, 2026-11-20; docs/render-thread-ideas-1120.md): PagesClean's last 1-7 pages of a range (most vertex ranges are that short) tested in one masked NEON block when none of their four views' cards is written, as the 8- and 16-page blocks do; else page by page as before")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt2_color_alias_memo, true, "SASRT/RenderThread",
++                    "Render thread (second round, 2026-11-20; docs/render-thread-ideas-1120.md): ColorAliasesLocked (two scans of every target per colour resolve, about 118 a frame in the 4-player race) answers from a per-surface list kept until a target is made or retired (the target table's epoch)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt2_repeat_recorded_index, true, "SASRT/RenderThread",
++                    "Render thread (second round, 2026-11-20; docs/render-thread-ideas-1120.md): WholeRepeatHit compares the replay's recorded index buffer (ReplayIndexBuffer, as WholeGeometryTry reads it) instead of the live guest header the game may have moved on since; and ReplayIndexBuffer reads the live header for its diagnostic count at one call in 64, not at every indexed replayed draw")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt2_held_export_bitmap, true, "SASRT/RenderThread",
++                    "Render thread (second round, 2026-11-20; docs/render-thread-ideas-1120.md): GetStreamSource looks in the kept exports' map (about 257 a frame in the 4-player race, a std::map walk per stream) only when a 64 KB granule bitmap of the kept exports' ranges says one may lie at the stream's address")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt2_place_wait_unlocked, true, "SASRT/RenderThread",
++                    "Render thread (second round, 2026-11-20; docs/render-thread-ideas-1120.md): The render thread's wait at a same-frame place (about 1.5 ms, four a frame in the 4-player race) does not hold State().mutex (the game thread's shader and declaration destroys waited behind it): it spins briefly, then waits on the place in slices")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt2_ring_prefetch, true, "SASRT/RenderThread",
++                    "Render thread (second round, 2026-11-20; docs/render-thread-ideas-1120.md): The render thread prefetches the next ring item's narrowed device delta to six lines, not four (it averages ~360 bytes in the 4-player race). Prefetches only")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt2_readable_memo, true, "SASRT/RenderThread",
++                    "Render thread (second round, 2026-11-20; docs/render-thread-ideas-1120.md): The vertex fills' check that their guest bytes are committed (dishonored_renut_vertex_readable_check: each a heap's recursive mutex, which the game's allocations hold too, and a page-table walk) keeps the ranges it found readable, 64 of them, while no page anywhere has lost read access since (rex::memory::g_page_access_generation, raised at every decommit, release, protect, reset and restore)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt2_bind_layout_narrow, true, "SASRT/RenderThread",
++                    "Render thread (second round, 2026-11-20; docs/render-thread-ideas-1120.md): A fast draw after a layout change anywhere (g_layout_epoch moves at every transition) binds its targets again only when one of its own is not in the layout BindTargets would leave it in (colour write; depth write, or read for a draw that writes no depth with banjo_deko3d_depth_read_layout), holds a hand-over or a pending restore copy, or the GPU profile is timing; else BindTargets would change nothing")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt2_texture_memo_two_way, true, "SASRT/RenderThread",
++                    "Render thread (second round, 2026-11-20; docs/render-thread-ideas-1120.md): FillTextures' texture slot memo (4,096 entries by texture address and fetch words) as 2,048 sets of two ways: a texture's entry kept while another hashes to its set, the way bound in an earlier frame replaced (the four-player race missed ~1,950 binds a second to another entry, each a whole BindTextureLocked). Every hit checks the entry's words as before")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt2_repeat_ring, true, "SASRT/RenderThread",
++                    "Render thread (second round, 2026-11-20; docs/render-thread-ideas-1120.md): WholeGeometryTry's repeat answer (blur_renut_whole_repeat: a draw whose streams, index buffer, shader and layout are an earlier draw's of the same kick takes its copies without the probes) kept for the last four such answers, not the last one: draws that take turns between a few meshes")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt3_words_owner_table, true, "SASRT/RenderThread",
++                    "Render thread (third round, 2026-11-20; docs/render-thread-ideas-1120.md): SasrtWordsViewOwnerLocked (the restore copy's words view owner) remembers an answer per slot in a 256-entry table, each checked as before, not one last answer: four views' restore copies took turns on it, each miss a walk of every texture")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt3_surface_memo_256, true, "SASRT/RenderThread",
++                    "Render thread (third round, 2026-11-20; docs/render-thread-ideas-1120.md): GetHostSurfaceLocked's memo (a surface's target by its address, header words and the surface epoch) has 256 entries, not 64: the four views' targets, resolves, EDRAM views and stack headers conflicted in 64")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt3_depth_bias_fields, true, "SASRT/RenderThread",
++                    "Render thread (third round, 2026-11-20; docs/render-thread-ideas-1120.md): A fast draw does not call SetDrawDepthBias when the bias set is still bound and none of the packets it reads (the view packets' mode control, the point packet's bias words, the destination packet's depth info) changed since the draw before in the chain")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt3_place_spin, true, "SASRT/RenderThread",
++                    "Render thread (third round, 2026-11-20; docs/render-thread-ideas-1120.md): The render thread spins on a same-frame place's flag for sasrt_rt3_place_spin_us before it sleeps (the render thread has core 1 to itself): a recording that ends within it is taken without the kernel's sleep and wake")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt3_host_packets_split, true, "SASRT/RenderThread",
++                    "Render thread (third round, 2026-11-20; docs/render-thread-ideas-1120.md): Host packets (banjo_renut_host_packets: a replayed draw's derived state kept by its device words) while the screen is split (two to four views replay the same state words), whatever banjo_renut_host_packets says; one player as the key says. The recording makes the packet keys always with this key on")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt4_push_runs_merged, true, "SASRT/RenderThread",
++                    "Render thread (fourth round, 2026-11-20; docs/render-thread-ideas-1120.md): PushFloatConstants pushes two runs of constant groups that one or two groups separate as one run, the groups between them with the device's current bytes (they become valid); never across a group with a literal register of this shader or of the buffer: one dkCmdBufPushConstants call instead of two")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt4_state_id_crc, true, "SASRT/RenderThread",
++                    "Render thread (fourth round, 2026-11-20; docs/render-thread-ideas-1120.md): RenderStateIdLocked (the render-state number by content) finds its table slot by a CRC32C of the 20 render-state words and the targets' words (the A57's crc32cx, 8 bytes an instruction) instead of 27 dependent multiplies; a hit compares the words as before")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt4_pipeline_four_way, false, "SASRT/RenderThread",
++                    "Render thread (fourth round, 2026-11-20; docs/render-thread-ideas-1120.md): The fast draw's pipeline cache looks in the four entries of the index's aligned group, not two: an answering entry, else the way made from this draw's inputs, an empty one, or the one used longest ago (the 4P race had 4,516 conflicts a 10 s with two ways, each a MakeKey and pipeline lookup)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt4_spec_key_skip, true, "SASRT/RenderThread",
++                    "Render thread (fourth round, 2026-11-20; docs/render-thread-ideas-1120.md): A fast draw whose spec answers are the spec memo's (sasrt_rt2_spec_memo hit) does not compare them with the kept pipeline key's fields (the 80 spec words, fetch pad, clip bit, fetch spec types) when that key was last checked against the same memo answers and no pipeline key has been written since (a count of every key write)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt4_stream_memo_two_way, false, "SASRT/RenderThread",
++                    "Render thread (fourth round, 2026-11-20; docs/render-thread-ideas-1120.md): The stream and index caches' entry memos (EntryMemo, 16,384 slots) look in a slot and its pair (two ways, the most recently used first: a hit in the second swaps them, a new entry pushes the first into the second) instead of one: four views' thousands of stream and index keys a frame conflicted in the direct-mapped slots, each conflict a map lookup")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt4_ring_lock_once, true, "SASRT/RenderThread",
++                    "Render thread (fourth round, 2026-11-20; docs/render-thread-ideas-1120.md): The render thread keeps State().mutex from one queued draw (QueuePrefetched's items) into the next when that one is published already, at most 8 in a row and never past the ring run's end: a lock and an unlock fewer a draw. Place waits and every other item take it on their own as before (holding it across those deadlocked in 2026-10-19's proposal 19)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt4_inert_keeps_chain, true, "SASRT/RenderThread",
++                    "Render thread (fourth round, 2026-11-20; docs/render-thread-ideas-1120.md): A draw left out before the fast path (sasrt_gpu_skip_inert_draws, sasrt_gpu_skip_cull_both) keeps the fast path's chain: the fast state takes its number and its changed fields are carried into the next draw's, instead of the next draw finding a chain break and taking the full path")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_rt4_export_reads_fast, true, "SASRT/RenderThread",
++                    "Render thread (fourth round, 2026-11-20; docs/render-thread-ideas-1120.md): A draw whose only reads of pending memexport results are vertex streams the host layout reads from windows FindExportedStream finds on the GPU stays on the fast path: ConvertExportedStreamsLocked converts them there (as DrawStateLocked does) and BindStreams binds the converted streams; whole-buffer geometry and fetch, index and texture reads of exports take the full path as before (the 4P race: 93 'export read' draws a frame to the full path)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_cut_ambient_sky, false, "SASRT/GPU",
++                    "CHANGES PIXELS where the sky's ambient term shows (sixth GPU round, item 78, A/B 168): SASRT's HDR "
++                    "composite draws a full-screen additive pass, pixel shader ED0A8D53 (~1.5 ms a race frame: three "
++                    "volume-texture lookups a pixel, 47 registers) with no depth or stencil test, so it shades the sky too "
++                    "(~40 % of a race frame's pixels are at the clear depth). With this key it is drawn with the depth "
++                    "bounds test excluding the clear depth of the restored scene depth bound to it (known from the depth "
++                    "restore: 0 or 1, exact): sky pixels keep what the passes before gave them. The sun's and point lights' "
++                    "passes already skip the sky (their stencil test)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_convert_vertex_pass, true, "SASRT/GPU",
++                    "deko3d renderer (fifth GPU round, item 53, A/B 143): an exported stream's conversion into vertex format "
++                    "(stream_convert_cs, ~45 small dispatches a race frame between an export draw and the draw that reads "
++                    "it, ~15 us each: each one switches the 3D engine to compute and back) drawn instead as a point list "
++                    "of one vertex per element with the rasterizer off, whose vertex shader (stream_convert_vs) runs the "
++                    "same conversion code and stores the same words; the waits around it are the same. The same vertex "
++                    "data: the same pixels")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sasrt_gpu_fetch_exp_3d_spec, true, "SASRT/GPU",
++                    "deko3d renderer (fifth GPU round, item 52, A/B 142): item 51 for the exponent adjust a 3D or cube fetch "
++                    "reads from its own word (texture_indices[1] / [2] bits 20-25): constants 958-965 (3D) and 966-973 "
++                    "(cube) for fetch constants 0-7 (pass fetchconv). The race's composite pass (ED0A8D53) reads its 3D "
++                    "lookup tables' words this way. Same values: the same pixels")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DEFINE_BOOL(sasrt_gpu_fetch_conversion_spec, true, "SASRT/GPU",
+                     "deko3d renderer (fifth GPU round, item 51, A/B 141): a pixel shader's texture fetch applies Xenos' "
+                     "signs, gamma and exponent adjust from the draw's words (SharedConstants: sampler bits 13-19, the 2D "
+                     "texture word's bits 20-25) for each of the four channels, choosing among the conversions at run time; "
+                     "item 3 (sasrt_gpu_plain_fetches) drops the block where a fetch constant has none of them. Here the "
+                     "words of fetch constants 0-7 are constants of the draw (950-957, pass fetchconv), so the shader keeps "
+                     "only the conversions the draw's texture has, on the channels that have them. The same operations on "
+-                    "the same values: the same pixels")
+-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+-REXCVAR_DEFINE_BOOL(sasrt_gpu_fetch_exp_3d_spec, true, "SASRT/GPU",
+-                    "deko3d renderer (fifth GPU round, item 52, A/B 142): item 51 for the exponent adjust a 3D or cube fetch "
+-                    "reads from its own word (texture_indices[1] / [2] bits 20-25): constants 958-965 (3D) and 966-973 "
+-                    "(cube) for fetch constants 0-7 (pass fetchconv). Same values: the same pixels")
+-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+-REXCVAR_DEFINE_BOOL(sasrt_gpu_convert_vertex_pass, false, "SASRT/GPU",
+-                    "SASRT only (fifth GPU round, item 53, A/B 143: flat on its console; no code here)")
+-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+-// sasrt-nx's render-thread round (2026-11-09; port 54): items 54 and 55, A/B 144 and 145; target 200 switches both.
+-REXCVAR_DEFINE_BOOL(sasrt_rt_restore_candidates, true, "SASRT/RenderThread",
+-                    "Render thread (sasrt-nx's render-thread round, RT1; item 54, A/B 144): the EDRAM depth restore "
+-                    "(sasrt_renut_depth_restore) asks, for every draw with a depth target bound whose surfaces were written "
+-                    "since (the fast path's check; nearly every draw), which RGBA8 colour target over the same EDRAM base "
+-                    "and pitch was written after the depth (DepthRestoreSourceLocked). That scanned the whole target table "
+-                    "twice (to find the depth's own key, then every target; ~2.6 % of Sonic Transformed's render thread). "
+-                    "With this key each depth target keeps its own few candidates (same base and pitch, colour, one "
+-                    "sample, its scale, RGBA8 or BGRA8), found again only when a target is built or retired (an epoch of "
+-                    "its own): the same answer from the same write sequences")
+-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+-REXCVAR_DEFINE_BOOL(sasrt_rt_cached_export_seeds, true, "SASRT/RenderThread",
+-                    "Render thread (sasrt-nx's render-thread round, RT5; item 55; chosen at start, so no in-run A/B: "
+-                    "target 145 does nothing): with sasrt_gpu_seed_cpu_direct (item 30) the CPU writes each fresh memexport "
+-                    "window's seed (its guest bytes) into the slot's export buffer, which was CPU-uncached memory: "
+-                    "memcpy's bulk loop at uncached speed was ~2 % of Sonic Transformed's render thread. With this key the "
+-                    "buffer is CPU-cached (plume: an upload buffer with HOST_CACHED, flushed at creation so no older dirty "
+-                    "line can land on the GPU's results) and each seed's lines are cleaned right after it is written, "
+-                    "before anything is submitted. The windows start on 256-byte boundaries, so no line holds two windows; "
+-                    "every line a seed touches is wholly its own: the GPU sees the same bytes. The CPU never reads the "
+-                    "buffer (readbacks go through a GPU copy). For games with memory exports")
++                    "the same values: the same pixels. The race's G-buffer shaders: 238 -> ~120 instructions")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ #if defined(PLUME_DEKO3D)
+ #include <plume_deko3d.h>
+ 
+ #include "renut_engine/gpu/banjo_renut_record.h"  // banjo-nx (2026-11-21): StageActive
+ #endif
++
++namespace renut::gpu {
++extern uint64_t g_sasrt_sampler_generation;  // render/draw.cpp (BindingEpoch)
++extern uint64_t g_texture_bind_gen;          // render/textures.h (base port 246's SlotLast::checked_gen)
++}
+ 
+ namespace sasrt::gpu_round {
+ 
+ Latched g_latched;
+@@ -590,11 +875,19 @@
+ uint8_t g_effective[kCount] = {};  // constant-initialised to 0: not latched
+ void RefreshEffective() {
+   const int ab = banjo::renut_gpu::g_ab_off.load(std::memory_order_relaxed);
+   for (int i = 0; i < kCount; ++i) {
+-    const bool on = g_latched.on[i] && ab != kAbBase + i && !(ab == kAbRtGroup && i >= kRtRestoreCandidates);
++    // sasrt-nx: the render-thread rounds' group targets 401-403 as well (as On() had them before)
++    const bool on = g_latched.on[i] && ab != kAbBase + i && !(ab == kAbRtGroup && i >= kRtRestoreCandidates) &&
++                    !(ab == kAbRt2Group && i >= SASRT_GPU_ROUND_RT2_FIRST) &&
++                    !(ab == kAbRt3Group && i >= SASRT_GPU_ROUND_RT3_FIRST) &&
++                    !(ab == kAbRt4Group && i >= SASRT_GPU_ROUND_RT4_FIRST);
+     g_effective[i] = on ? 2 : 1;
+   }
++}
++
++uint32_t SamplerCutBits() {
++  return (On(kCutMipNearest) ? 1u : 0u) | (On(kCutLodBias) ? 2u : 0u);
+ }
+ 
+ // banjo-nx (2026-11-21, the render thread to 33 ms; A/B 173): plume's Deko3DOptions::cachedCommands (see there).
+ // Console, Showdown Town, in-run pairs (median, render thread a draw with it on): c36 +0.11 % (21 pairs), c39 +0.90 %
+@@ -651,10 +955,16 @@
+ #define SASRT_GPU_ROUND_NAME(name, key, what) what " (" #key ")",
+       SASRT_GPU_ROUND_ITEMS(SASRT_GPU_ROUND_NAME)
+ #undef SASRT_GPU_ROUND_NAME
+   };
+-  if (target == kAbRtGroup)  // sasrt-nx (2026-11-09; port 54)
+-    return "the render-thread round's items, all at once (sasrt_rt_*, A/B 200)";
++  if (target == kAbRtGroup)  // sasrt-nx (2026-11-09)
++    return "the render-thread round's items, all at once (sasrt_rt_*, A/B 400; 200 before 2026-11-19)";
++  if (target == kAbRt2Group)  // sasrt-nx (2026-11-20)
++    return "the second render-thread round's items, all at once (sasrt_rt2_*, A/B 401)";
++  if (target == kAbRt3Group)  // sasrt-nx (2026-11-20)
++    return "the third render-thread round's items, all at once (sasrt_rt3_*, A/B 402)";
++  if (target == kAbRt4Group)  // sasrt-nx (2026-11-20)
++    return "the fourth render-thread round's items, all at once (sasrt_rt4_*, A/B 403)";
+   const int i = target - kAbBase;
+   return i >= 0 && i < kCount ? kNames[i] : nullptr;
+ }
+ 
+--- base/sdk/include/rex/system/xmemory.h
++++ sasrt-nx/sdk/include/rex/system/xmemory.h
+@@ -169,8 +162,13 @@
+   };
+ };
+ 
+ // Heap abstraction for page-based allocation.
++// sasrt-nx (2026-11-20, sasrt_rt2_readable_memo): raised at the start of every heap operation that can take read
++// access from a page (Decommit, Release, Protect, Reset, Restore): an answer that a range was readable holds
++// while it is unchanged (the renderer's vertex fills keep such answers instead of walking the page table).
++extern std::atomic<uint64_t> g_page_access_generation;
++
+ class BaseHeap {
+  public:
+   virtual ~BaseHeap();
+ 
+--- base/sdk/src/system/xmemory.cpp
++++ sasrt-nx/sdk/src/system/xmemory.cpp
+@@ -1157,8 +1133,10 @@
+ 
+ BaseHeap::BaseHeap() : membase_(nullptr), heap_base_(0), heap_size_(0), page_size_(0) {}
+ 
+ BaseHeap::~BaseHeap() = default;
++
++std::atomic<uint64_t> g_page_access_generation{1};  // sasrt-nx (2026-11-20, sasrt_rt2_readable_memo): xmemory.h
+ 
+ std::unique_lock<std::recursive_mutex> BaseHeap::AcquireHostPageReconcileLock() const {
+   if (page_size_ >= memory_->system_page_size_) {
+     return {};
+@@ -1416,8 +1394,9 @@
+   return true;
+ }
+ 
+ bool BaseHeap::Restore(stream::ByteStream* stream) {
++  g_page_access_generation.fetch_add(1, std::memory_order_acq_rel);  // sasrt-nx (2026-11-20)
+   REXSYS_DEBUG("Heap {:08X}-{:08X}", heap_base_, heap_base_ + (heap_size_ - 1));
+ 
+   const uint32_t host_page_size = memory_->system_page_size_;
+   const bool reconcile_host_pages = page_size_ < host_page_size;
+@@ -1493,8 +1472,9 @@
+   return true;
+ }
+ 
+ void BaseHeap::Reset() {
++  g_page_access_generation.fetch_add(1, std::memory_order_acq_rel);  // sasrt-nx (2026-11-20)
+   // TODO(DrChat): protect pages.
+   std::memset(page_table_.data(), 0, sizeof(PageEntry) * page_table_.size());
+   // TODO(Triang3l): Remove access callbacks from pages if this is a physical
+   // memory heap.
+@@ -1538,8 +1518,12 @@
+ }
+ 
+ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignment,
+                           uint32_t allocation_type, uint32_t protect) {
++  // sasrt-nx (2026-11-20, sasrt_rt2_readable_memo): a commit over pages already committed sets their protection (it
++  // can take read access away): the readable answers go when the new one has no read.
++  if (!(protect & memory::kMemoryProtectRead))
++    g_page_access_generation.fetch_add(1, std::memory_order_acq_rel);
+   alignment = rex::round_up(alignment, page_size_);
+   if (base_address % alignment != 0) {
+     if (base_address % page_size_ != 0) {
+       REXSYS_ERROR(
+@@ -1827,8 +1811,9 @@
+   return true;
+ }
+ 
+ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
++  g_page_access_generation.fetch_add(1, std::memory_order_acq_rel);  // sasrt-nx (2026-11-20)
+   uint32_t page_count = get_page_count(size, page_size_, page_size_shift_);
+   uint32_t start_page_number = (address - heap_base_) >> page_size_shift_;
+   uint32_t end_page_number = start_page_number + page_count - 1;
+   start_page_number = std::min(uint32_t(page_table_.size()) - 1, start_page_number);
+@@ -1863,8 +1848,9 @@
+   return true;
+ }
+ 
+ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
++  g_page_access_generation.fetch_add(1, std::memory_order_acq_rel);  // sasrt-nx (2026-11-20)
+   // Global critical region before heap_mutex_ - see
+   // AcquireHostPageReconcileLock for why the order matters.
+   auto global_lock = AcquireHostPageReconcileLock();
+   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+@@ -1925,8 +1911,9 @@
+   return true;
+ }
+ 
+ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32_t* old_protect) {
++  g_page_access_generation.fetch_add(1, std::memory_order_acq_rel);  // sasrt-nx (2026-11-20)
+   if (!size) {
+     REXSYS_ERROR("BaseHeap::Protect failed due to zero size");
+     return false;
+   }

@@ -1,0 +1,99 @@
+--- out/console_runs/c1120_rt4_build/textures_rt4h.cpp	2026-11-21 01:09:51.386023800 +1000
++++ app/src/renut_engine/gpu/render/textures.cpp	2026-11-21 01:09:51.510099400 +1000
+@@ -56,6 +56,10 @@
+ 
+ namespace renut::gpu {
+ 
++// sasrt-nx (2026-11-21, sasrt_resolve_remake_carry): render/draw.cpp, a resolve destination's content drawn into the
++// texture made again for it.
++bool SasrtCarryResolveContentLocked(HostTexture *from, HostTexture *to);
++
+ namespace {
+ 
+ // Fetch constant bits that describe the texture data (not sampling).
+@@ -113,6 +117,25 @@
+                     "of a texture made from guest memory the GPU never wrote (the menus' one-frame flash, 2026-11-20)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ std::unordered_map<u32, std::array<HostTexture *, 2>> g_resolve_targets_previous;
++// sasrt-nx (2026-11-21, the split screen's dark far shadows; the user: "make sure you fix the shadows please"; run 336's
++// view dump): a resolve destination made again only for another scale or size (the dynamic resolution's steps) lost
++// its content (a new image, discarded), where the console's memory keeps it. In three and four players each view's
++// shadow cascades are one 512x1024 destination, the near cascade resolved into its top half every frame and the far
++// cascade into its bottom half only when the game redraws it (at the race's start); the race starts below 1x and the
++// 3D steps up to 720 lines, each step making the destinations again: the far half then held whatever memory the new
++// image got (run 336: NaN, 3.4e38, -25.7, old scene depths), read as "lit" or as "shadowed" by chance (the far
++// geometry flat dark grey from the start to the end of the race, in some views of some runs, only at the user's
++// clocks: at the overclock the 3D stays at 1x and nothing is made again). Now the old image is drawn into the new one
++// (point sampled, scaled), then retired. 1: depth resolve destinations (the cascades), 2: colour ones too, 0: off.
++REXCVAR_DEFINE_INT32(sasrt_resolve_remake_carry, 1, "SASRT/Graphics",
++                     "A resolve destination made again for another render scale or size keeps its content: the old "
++                     "image is drawn (scaled) into the new one before it is retired (2026-11-21, the split screen's dark "
++                     "far shadows: the far cascade, resolved only at the race's start, was lost at the dynamic "
++                     "resolution's steps). 1 depth destinations, 2 colour ones too, 0 off (the new image's content is "
++                     "undefined, as before)")
++    .range(0, 2)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++uint64_t g_resolve_carried = 0, g_resolve_carry_failed = 0;
+ std::unordered_map<uint64_t, uint32_t> g_samplers;  // sampler key -> slot
+ std::vector<std::unique_ptr<plume::RenderSampler>> g_sampler_objects;
+ uint64_t g_frame = 1;
+@@ -1296,6 +1319,7 @@
+   // sasrt-nx (2026-11-12, resolve project R2, sasrt_gpu_words_probe_kept): what a destination made again at the same
+   // address and format knew about its depth words (its readers do not change with the scale).
+   static const bool probe_kept = REXCVAR_GET(sasrt_gpu_words_probe_kept);
++  std::unique_ptr<HostTexture> carry_from;  // sasrt-nx (2026-11-21, sasrt_resolve_remake_carry)
+   bool carry_words = false, carried_wanted = false;
+   uint32_t carried_probe = 0;
+   {  // blur-nx (2026-11-17, audit #5): the reason a destination is made (ResolveRemakeReport)
+@@ -1339,8 +1363,18 @@
+                 slot->alloc_width != scale.Size(slot->width) || slot->alloc_height != scale.Size(slot->height),
+                 slot->desc[0], slot->desc[1], slot->desc[2], slot->desc[3], slot->desc[4], slot->desc[5], desc[0],
+                 desc[1], desc[2], desc[3], desc[4], desc[5]);
+-    Retire(*slot);
+-    slot.reset();
++    // sasrt-nx (2026-11-21, sasrt_resolve_remake_carry): made again for its scale or size alone: its image is kept
++    // until the new one has its content.
++    static const int32_t carry_mode = REXCVAR_GET(sasrt_resolve_remake_carry);
++    if (carry_mode > 0 && (depth || carry_mode >= 2) && slot->render_target && slot->texture &&
++        slot->host_format == format && std::memcmp(slot->desc, desc, sizeof(desc)) == 0 && slot->resolves > 0 &&
++        slot->dimension == TextureDimension::Tex2D && !slot->stacked && slot->mip_levels == 1 &&
++        slot->extra_levels == 0)
++      carry_from = std::move(slot);
++    if (slot) {
++      Retire(*slot);
++      slot.reset();
++    }
+   }
+   if (!slot) {
+     NoteRemadeAfterLongIdle(texture_va, "resolve destination");  // sasrt-nx (2026-11-10): the M35 hang hunt
+@@ -1352,6 +1386,8 @@
+       RGPU_ERROR("Resolve destination {:08X}: {}x{} target creation failed", texture_va,
+                  slot->width, slot->height);
+       Retire(*slot);
++      if (carry_from)  // sasrt-nx (2026-11-21)
++        Retire(*carry_from);
+       return nullptr;
+     }
+     if (carry_words) {  // sasrt-nx (2026-11-12, R2)
+@@ -1368,6 +1404,21 @@
+       TransitionTextureLocked(slot.get(), plume::RenderTextureLayout::COLOR_WRITE);
+       cmd->discardTexture(slot->texture.get());
+     }
++    // sasrt-nx (2026-11-21, sasrt_resolve_remake_carry): the old image's content into it, then the old one retired.
++    if (carry_from) {
++      const bool carried = SasrtCarryResolveContentLocked(carry_from.get(), slot.get());
++      ++(carried ? g_resolve_carried : g_resolve_carry_failed);
++      const uint64_t n = g_resolve_carried + g_resolve_carry_failed;
++      if (n <= 8 || (n & (n - 1)) == 0)
++        RGPU_INFO("[sasrt] resolve destination {:08X} ({}x{}, {}) made again at {}x{}: its content {} ({} carried, {} "
++                  "not, so far; sasrt_resolve_remake_carry)", texture_va, slot->width, slot->height,
++                  depth ? "depth" : "colour", slot->alloc_width, slot->alloc_height,
++                  carried ? "drawn into the new image" : "NOT carried", g_resolve_carried, g_resolve_carry_failed);
++      if (carried)
++        slot->resolves = carry_from->resolves;  // it holds what they wrote
++      Retire(*carry_from);
++      carry_from.reset();
++    }
+   }
+   slot->gpu_written = true;
+   slot->uploaded = true;

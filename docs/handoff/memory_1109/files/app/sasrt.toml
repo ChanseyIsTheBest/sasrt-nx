@@ -1,0 +1,115 @@
+# Settings read at startup (ReXGlue cvars). The build copies this file next to the executable when there is none
+# there yet; edit the copy. Any cvar can also be given on the command line (--name=value) or as REX_<NAME>.
+
+# GPU: stage 1 draws with ReXGlue's emulated Xenos GPU (D3D12 on Windows).
+gpu_plugin = "xenos"
+
+log_level = "info"
+
+# Development defaults: launch muted and minimized (in the taskbar, no fullscreen, no focus), so test runs do not
+# take over the desktop or the speakers. Set both to false to play.
+audio_mute = true
+window_start_minimized = true
+
+# Tracing of the game's Direct3D (app/src/sasrt_d3d_trace.cpp): calls and callers every 5 s.
+sasrt_d3d_trace = false
+
+# Stage 4: the native Vulkan renderer (app/src/me) instead of the emulated Xenos GPU. Needs sasrt_shaders.mesp next to
+# the executable (tools/build_shader_library.sh from a shader dump).
+masseffect_renderer_native = false
+# Write every shader container the game creates to shaders/ next to the executable, for the shader package.
+sasrt_dump_shaders = false
+
+# Renut's renderer on the PC (sasrt_renderer = "renut"): Vulkan, the back end nearest the Switch's deko3d. On D3D12
+# the race's sky flickers (missing or broken in some frames; 2026-10-20, not solved).
+renut_gpu_backend = "vulkan"
+
+# sasrt-nx (2026-11-08, the move to the ultimate base, docs/ultimate-base.md): halo3-nx's replay inheritance (h1) off for
+# this game: with it a replay of a captured run (sasrt_renut_scene_same_frame's slots) crashed in BuildInheritRuns in
+# the first PC run (an access violation 5.7 s in). The replays are as before the move.
+banjo_renut_replay_inherits = false
+
+# sasrt-nx (2026-11-08): the GPU round after the move to the ultimate base (docs/gpu-round-1108.md): 15 pixel-identical
+# GPU optimisations, each its own key; in-run A/B: banjo_renut_ab_target = 90 + the item's number (configs/sasrt_gpu_ab_*).
+sasrt_gpu_skip_inert_draws = true          # 0: draws that can write nothing are not drawn
+sasrt_gpu_precise_depth_resolve = true     # 1: depth decompressed only when written since its last decompression
+sasrt_gpu_plain_fetches = true             # 2: no sign / gamma / exponent code for plain fetches (constant 926)
+sasrt_gpu_alpha_spec = true                # 3: no discard without the alpha test (early depth for opaque draws)
+sasrt_gpu_gamma_upload_once = true         # 4: the gamma ramp copied when it changes
+sasrt_gpu_decompress_merge = true          # 5: a decompression's barrier merged with the pending one
+sasrt_gpu_readback_barrier_merge = true    # 6: a readback's full barriers merged with their neighbours
+sasrt_gpu_fetch_copy_compute = true        # 7: memexport seeds and fetch data copied by the 3D engine
+sasrt_gpu_data_cache_invalidate = true     # 8: buffer barriers drop data caches, not shader code
+sasrt_gpu_one_x = true                     # 9: a 1x draw's scale codes and pixel-position scale folded
+sasrt_gpu_face_sign = true                 # 10: the face sign without its reciprocal (constant 928)
+sasrt_gpu_readback_compute = true          # 11: the memexport readbacks copied by the 3D engine
+sasrt_gpu_tiled_cache = false              # 12: Maxwell's tiled caching (the console's to judge: configs/sasrt_gpu_try_tiled_cache)
+sasrt_gpu_texel_readback_compute = true    # 13: the 1x1 luminance read back by the 3D engine
+sasrt_gpu_lazy_depth_resolve = false       # 14: depth decompressed right before its read (configs/sasrt_gpu_try_lazy_depth)
+# The second round (2026-11-08, docs/gpu-round-1108.md "Round 2"): A/B 90 + the item's number (105-119).
+sasrt_gpu_seed_no_lead_wait = true         # 15: memexport seeds into fresh windows without a wait first
+sasrt_gpu_convert_lead_wait = true         # 16: a conversion without its wait when no export was drawn since one
+sasrt_gpu_identity_ramp = true             # 17: the linear gamma ramp not looked up at scan-out
+sasrt_gpu_convert_memo_keep = true         # 18: stream conversions used again across new exports
+sasrt_gpu_depth_resolve_float_ps = true    # 19: a depth resolve without words by a float-only shader
+sasrt_gpu_same_targets_kept = true         # 20: the bound targets not bound again
+sasrt_gpu_readback_spans = true            # 21: readback windows that follow one another copied by one dispatch
+sasrt_gpu_seed_wait_only = true            # 22: the wait after the seeds keeps the caches
+sasrt_gpu_readback_fence_flush = true      # 23: the compute readbacks without an L2 flush of their own
+sasrt_gpu_convert_tail_vertex_only = true  # 24: the wait after a conversion drops the texture cache alone
+sasrt_gpu_convert_lead_data_only = true    # 25: the wait before a conversion drops the data cache alone
+sasrt_gpu_clip_spec = true                 # 26: no user clip distance where no plane is set (constant 929)
+sasrt_gpu_lean_barrier_skip = true         # 27: a move into a target layout with nothing to wait for is no barrier
+sasrt_gpu_readback_barriers_trim = true    # 28: the readback's waits trimmed
+sasrt_gpu_export_raster_discard = true     # 29: export draws that write nothing drawn with the rasterizer off
+# The third round (2026-11-08, docs/gpu-round-1108.md "Round 3"): A/B 90 + the item's number (120 on).
+sasrt_gpu_seed_cpu_direct = true           # 30: memexport seeds written into their windows by the CPU: no copy dispatch, no wait
+sasrt_gpu_convert_tail_no_texture_drop = true # 31: the wait after a stream conversion keeps the texture cache too
+sasrt_gpu_vs_input_mask = true             # 32: vertex attributes the bound vertex shader variant never reads are not fetched
+sasrt_gpu_export_no_pixel_shader = true    # 33: export-only draws (rasterizer off) built without their pixel shader
+sasrt_gpu_vs_screen_space_spec = true      # 34: the vertex shaders' screen-space branch as a constant of the draw
+sasrt_gpu_vs_depth_remap_spec = true       # 35: the vertex shaders' depth remap branch as a constant of the draw
+sasrt_gpu_stacked_3d_spec = true           # 36: a 3D fetch's stacked-or-volume choice as a constant of the draw
+sasrt_gpu_stacked_filter_spec = true       # 37: a stacked fetch's layer filter and wrap as constants of the draw
+sasrt_gpu_fetch_endian_spec = true         # 38: a vertex shader's memory fetches' byte order as constants of the draw  # on again 2026-11-10 00:00: the octopus's explosion was the chain reuse's pipeline shortcut ignoring these words (fixed in draw.cpp; console octo_fix38)
+sasrt_gpu_gpr_cap = false                   # 39: OFF: slower on the console (spills)
+sasrt_gpu_gpr_cap_filter = false            # 40: OFF: slower on the console (spills)
+sasrt_gpu_export_format_spec = true        # 41: a memexport's format word as a constant of the draw: its one pack compiled
+sasrt_gpu_texture_drop_tracked = false      # 42: OFF: wrong on the console (compressed targets need the drop)
+sasrt_gpu_target_wait_tracked = true       # 43: a texture made a target waits only if it was sampled or copied since the last wait
+sasrt_gpu_read_wait_tracked = false         # 44: OFF: does nothing without item 42
+sasrt_gpu_handover_with_smaa = false       # 45: banjo's colour hand-over with SMAA: OFF, flat in the race (90 % of handed resolves drawn later anyway)
+sasrt_gpu_export_window_ubo = true         # 46: memexport windows read from the constant buffer, not a local array (constant 944)
+sasrt_gpu_export_list_topology = false     # 47: export draws as triangle or line lists: OFF, slower in the console A/B
+sasrt_gpu_export_no_point_gs = true        # 48: export point lists (rasterizer off) without the point-sprite geometry shader
+sasrt_gpu_depth_restore_direct = true      # 49: the EDRAM depth restore in one pass, its colour copy left out (console run I: identical on every texel, -1.35 ms)
+sasrt_gpu_depth_restore_whole_clear = true # 50: the depth restore clears depth and stencil together when it draws the whole target
+sasrt_gpu_fetch_conversion_spec = true     # 51: a fetch's sign, gamma and exponent words as constants of the draw (950-957)
+sasrt_gpu_fetch_exp_3d_spec = true         # 52: a 3D or cube fetch's exponent adjust as a constant of the draw (958-973)
+sasrt_gpu_convert_vertex_pass = false      # 53: exported stream conversions as a vertex pass (OFF: flat on the console, run D)
+sasrt_gpu_shadow_uncompressed = false      # 59: shadow-map depth targets without hardware compression (OFF: run K, shadows +0.62 ms, resolves -0.20)
+sasrt_gpu_shadow_d32f = true               # 68: shadow-map depth targets as D32F, no stencil (run L: shadows -0.15 ms, depth resolves -0.11; no stencil use seen)
+sasrt_gpu_skip_copy_back = true            # 69: a post copy of a resolve back into its own unchanged target not drawn (run O: 5050 checked, 0 texels differ)
+sasrt_gpu_depth_restore_reuse = true       # 60: a second restore of the same unchanged resolve binds the first one's depth (console -1.1 ms)
+sasrt_gpu_depth_restore_clear_skip = true  # 63: the direct restore keeps the clear where the depth is the clear depth (console -1.0 ms)
+# The fifth round's cuts: each CHANGES PIXELS (or may), all OFF; the user decides which stay (docs/gpu-round-1108.md, round 5).
+sasrt_gpu_cut_depth_alias = false          # 54 CHANGES PIXELS: light and composite passes test the G-buffer's own depth
+sasrt_gpu_cut_restore_copy_drop = false    # 55 CHANGES PIXELS: a restore copy left out is never drawn
+sasrt_gpu_cut_mip_nearest = false          # 56 CHANGES PIXELS: trilinear textures sampled bilinear
+sasrt_gpu_cut_lod_bias = false             # 57 CHANGES PIXELS: mipmapped textures half a level smaller
+sasrt_gpu_cut_shadow_two_thirds = false    # 58 CHANGES PIXELS: shadow maps at two thirds of their size (-0.5 ms; VISIBLY BAD: the car's shadow smears, run N)
+sasrt_gpu_cut_take_on_overwrite = false    # 61: a handed resolve keeps the image a full-screen post draw overwrites (needs 45). Identical in the race (run X: 0 of 324 M texels left), gain unclear (-0.97..+0.03 ms); split-screen unchecked
+sasrt_gpu_cut_gather_pcf = false           # 62 MAY CHANGE PIXELS: four point shadow taps as one gather
+sasrt_gpu_cut_ssao_off = false             # 64 CHANGES PIXELS: no ambient occlusion
+sasrt_gpu_cut_pcf_half = false             # 65 CHANGES PIXELS: the shadow filter averages 4 of its 8 PCF places (flat on the console)
+sasrt_gpu_cut_no_aa = false                # 66 CHANGES PIXELS: no anti-aliasing (SMAA not run; run H -1.66 ms)
+sasrt_gpu_cut_shadow_alpha_casters = false # 67 CHANGES PIXELS: alpha-tested shadow casters not drawn (flat on the console)
+sasrt_gpu_cut_far_cascade = false          # 70 CHANGES PIXELS: the far shadow cascade not drawn: no shadows far away (run O -1.93 ms)
+sasrt_gpu_cut_far_cascade_half_rate = false # 71 CHANGES PIXELS: the far shadow cascade drawn every other frame
+sasrt_gpu_cut_bloom_off = false            # 72 CHANGES PIXELS: no bloom (the 160x68 blurs cleared to black; run R -0.54 ms)
+sasrt_gpu_cut_smaa_low = false             # 73 CHANGES PIXELS: SMAA's low preset edge threshold (0.15; run S -0.82 ms)
+sasrt_gpu_cut_ssao_half_rate = false       # 74 CHANGES PIXELS: SSAO every other frame (run S: +0.47 ms, does not pay)
+sasrt_gpu_cut_shadows_off = false          # 75 CHANGES PIXELS: no shadows at all (run T -2.51 ms)
+sasrt_gpu_cut_point_lights_off = false     # 76 CHANGES PIXELS: no point lights (the sun and ambient stay; run T -0.96 ms)
+sasrt_gpu_shadow_atlas_direct = false      # 77: identical, but slower (run W: +0.45 ms; the shadow maps' depth goes uncompressed)
+sasrt_gpu_cut_ambient_sky = false          # 78 CHANGES PIXELS (the sky's ambient term, unless a later pass replaces it): the ambient pass ED0A8D53 not shaded at the clear depth (run X: flat, does not pay)

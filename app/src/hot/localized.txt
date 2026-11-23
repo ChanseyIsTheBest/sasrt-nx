@@ -1,0 +1,52 @@
+# 2026-11-08: NO LONGER USED. The copies moved to app/src/cpu/hot/localized.txt (katamari-nx's localizer and guard).
+#
+# Guest functions replaced by localized copies (tools/localize_native.py), regenerated into app/generated/hot/ (with
+# hooks.inc) by tools/post_codegen.py after every codegen, so each copy matches the flavour it is built with. One per
+# line: <address> <what>.
+#
+# Batch 1 (2026-10-06): from the 30 hottest guest functions of the PC profile of the game's threads (busy samples of
+# every thread but the renderer's own, a race on track 2.3 with the 100% save, 150 s), ranked by
+# tools/arm_hot_functions.py with their AArch64 cost, plus lower-ranked leaves for guard coverage. Shares are of the
+# game threads' busy samples on the PC. Kept: the copies that were faster on the PC A/B (tools/win/natives_ab.ps1,
+# per-function samples natives on / off): the leaves and 827C56C8, whose only calls are the register save/restore
+# helpers. Left out after that A/B: the 22 copies that call other functions (825E0F28, 8278E170, 827506C0, 825753E8,
+# 82754220, 8274F568, 82997B38, 82610588, 82754EC0, 82ECA7A8, 8260F1D0, 827C0330, 825BCD10, 8279AFE0, 82C86720,
+# 82998CF8, 82564D28, 8275EDE0, 8278E838, 8274C300, 82C80B90, 825B9A80): writing back and reloading every localized
+# register at each call cost more than the locals saved (e.g. 82754EC0 850 -> 1,538 samples, 8274C300 503 -> 1,060);
+# they need a localizer that syncs only the registers a call can read or change. sub_82C90430 is refused (bare double
+# arithmetic). The CRT memcpy (82C8EEF0) is a hand-written native (app/src/hot/n_82C8EEF0.h), not listed here.
+# (moved) 827C56C8 hot game function, only the register save/restore helpers as calls (1.1 %; PC A/B 1,894 -> 1,625 samples)
+# (moved) 82757940 hot game function, leaf (0.3 %; 482 -> 236)
+# (moved) 82611908 hot game function, leaf (0.2 %; 413 -> 252)
+# (moved) 827168E0 hot game function, leaf (0.4 %; 810 -> 616)
+# (moved) 82748550 hot game function, leaf (0.4 %; 548 -> 532)
+# (moved) 8279A888 hot game function, leaf (0.2 %; 349 -> 290)
+# Leaf functions from further down the same profile, whose memory accesses all go through the guest-memory macros:
+# they run with the shadow guard (verify mode checks every call), which tests the localizer's transformation on this
+# game's generated code end to end.
+# (moved) 826116F0 hot game function, leaf (0.2 %; 314 -> 338)
+# (moved) 827C5DE8 hot game function, leaf (0.2 %; 256 -> 161)
+# (moved) 82C81418 hot game function, leaf (0.2 %; 345 -> 315)
+# (moved) 82C99110 hot game function, leaf (124 -> 115)
+# (moved) 82C80698 hot game function, leaf (99 -> 31)
+# (moved) 82934670 hot game function, leaf (173 -> 113)
+# (moved) 82C98FB0 hot game function, leaf (75 -> 72)
+# (moved) 82610250 hot game function, leaf (187 -> 100)
+#
+# Batch 2 (2026-10-07): the hottest function of the SlRenderer thread in the PC profile of a race (17 % of its
+# samples, sasrt_242): a 2D loop with lookup tables (it looks like the XDK's texture tiling) whose only calls are the
+# register save/restore helpers; the recompiled code makes ~1,000 uses of ctx.r3-r11. PC in-run A/B: -24 % samples.
+# 2026-10-21: out, a hand-written native now (app/src/hot/n_82E7F918_yuv.h: the movies' colour conversion).
+# 82E7F918 hot function of the SlRenderer thread (a tiling-like 2D loop), leaf (17 % of its PC samples)
+#
+# Batch 3 (2026-10-07): the next leaves of the game threads in the same PC profile (sasrt_250). Their only raw
+# memory accesses are 16-byte vector loads/stores through REX_RAW_ADDR, which the shadow run now takes over
+# (ShLoadV/ShStoreV), so they get the shadow guard (and so do the batch-1 leaves 82757940, 82748550 and 8279A888).
+# (moved) 82EB23E0 hot VMX function of the SlRenderer thread, leaf (3.3 % of its PC samples)
+# (moved) 830260A0 hot VMX function of the SlRenderer thread, leaf (1.5 %)
+# (moved) 83027D38 hot VMX function, leaf (0.2 % of all samples)
+# (moved) 830291B8 hot VMX function, leaf (0.2 % of all samples)
+# (moved) 82D7B288 hot VMX function of a worker thread (XThread2914), leaf (1.0 % of its samples)
+# Left out after the PC in-run A/B of batch 3 (sasrt_254, samples by phase): 82EB6B78, slower as a copy (1,207 ->
+# 1,363 samples, +13 %). 82EB23E0 2,137 -> 2,057 (-4 %); the small ones inline into their hooks, so the
+# profile cannot tell them apart: the console decides, like batch 1's leaves.

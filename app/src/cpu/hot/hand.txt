@@ -1,0 +1,18 @@
+# sasrt-nx (2026-11-08): guest functions with a HAND-WRITTEN native (app/src/cpu/hot/banjo_hand_natives.h, namespace
+# banjo::hand::n_<id>; the framework is katamari-nx's). tools/localize_native.py puts each in front of the generated
+# copy of its function wherever that copy is used (docs/optimising-functions.md, "Hand-written natives").
+#
+#   <address or generated name> [id=<namespace suffix>] [exact=<registers>]
+#
+# exact: registers the original writes back that the native leaves exactly as the original does (the others are the
+# guard's skip set). reads: the registers the native reads, for a native in front of a real call (tools/localize_native.py).
+
+# 2026-11-08 (the user: "hand optimise the top 10 functions"): docs/optimising-functions.md, "sasrt-nx's hand-written
+# natives", says which of the profile's top functions passed the gate and which declined, with the samples.
+82C92CC8 reads=r3   # stack cookie check: the equal path writes nothing (r11, cr6 are locals); 73 copies made a real call to it
+# 2026-11-12 batch D5: reads= (the native reads r1, r3-r5; v1 stored too as the original writes it and the native
+# leaves it): the water copies 828729E8 / 828703E0 call it in their loops; without reads= each call synced ~48 registers.
+82872180 reads=r1,r3,r4,r5,v1 exact=r1,r3,r4,r5,r6,r7,r8,r9,r10,f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13,v1,v58,v59,v60,v61,v62,v63   # water table lookup (2nd hottest, 1.9 %): 22 of 143 samples on its two msr fpcr
+8279A888 exact=r3,r4,r5,r6,r7,r8,r9,r10,f10,f11,f12,f13,v0,v12,v13,v61,v62,v63   # bounding sphere fit (SlRenderer, 0.6 %): 17 of 57 samples on two msr fpcr a point
+82720840 exact=r1,r3,r5,r6,r7,r8,r9,r10,f10,f11,f12,f13,v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v31,v56,v57,v58,v59,v60,v61,v62,v63   # audio resampler (0.8 %): 20 of 64 samples in the stvlx / stvrx byte loops
+8286C230 exact=r1,r3,r4,r5,r6,r7,r8,r9,r10,f10,f11,f12,f13,v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15,v16,v17,v18,v19,v20,v21,v22,v23,v24,v25,v26,v27,v28,v29,v30,v31,v32,v33,v34,v35,v36,v37,v38,v39,v40,v41,v42,v43,v44,v45,v46,v47,v48,v49,v50,v51,v52,v53,v54,v55,v56,v57,v58,v59,v60,v61,v62,v63   # water simulation step (the hottest, 2.3 %): about 70 of 207 samples in four misaligned vector stores a step

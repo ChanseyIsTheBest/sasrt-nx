@@ -1,0 +1,28 @@
+# Sonic & All-Stars Racing Transformed-specific analysis corrections for the code generator.
+#
+# Every entry needs its evidence (which tool or which log found it). The tools that produce candidates:
+#   tools/find_gaps.py, tools/gap_fixpoint.py   code the automatic discovery left without a function
+#   tools/pointer_fixpoint.py                   code pointers stored in data (vtables, callback tables) and built
+#                                               with lis/addi, checked against the code they point to
+#   tools/pointer_audit.py                      every other code pointer, in data or built in code
+#   tools/switch_check.py                       jump tables, case by case against the binary
+#   tools/runtime_gap_resolver.py               "Call to invalid or unregistered function" from a game log
+
+[functions]
+
+# Jump tables (tools/switch_check.py over .text and PSFD00, 2026-10-05: 181 tables, 145 absolute, 25 byte,
+# 11 halfword; none truncated, none missed).
+#
+# sub_82CEC5F8 switches on a 6-bit field (rlwinm r10,r9,0,26,31 at 0x82CEC6FC: 64 values, no cmplwi) through the byte
+# table 0x822F76E8, but MSVC wrote only 12 entries (0x21 0x24 0x27 0x2A 0x2D 0x30 0x33 0x36 0x3A 0 0 0; base
+# 0x82CEC728): the next bytes are the strings "LineTexture", "ArrayTexture", "CubeTexture", ... (the default
+# was __assume'd away). The generator read 64 entries, made cases 12-63 from the string bytes (null where they fell
+# outside the function). The real table, so that a value out of range stops on "Switch case out of range" instead of
+# jumping into the function.
+[[switch_tables]]
+address = 0x82CEC724
+register = 10
+labels = [
+    0x82CEC7AC, 0x82CEC7B8, 0x82CEC7C4, 0x82CEC7D0, 0x82CEC7DC, 0x82CEC7E8, 0x82CEC7F4, 0x82CEC800,
+    0x82CEC810, 0x82CEC728, 0x82CEC728, 0x82CEC728,
+]

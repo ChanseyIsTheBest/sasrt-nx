@@ -1,0 +1,187 @@
+--- base/app/src/renut_engine/gpu/banjo_renut_tuning.cpp
++++ sasrt-nx/app/src/renut_engine/gpu/banjo_renut_tuning.cpp
+@@ -74,14 +75,29 @@
+                     "shader compiles and the pipeline prebuild workers run there instead of on "
+                     "banjo_background_compile_core (off by default: core 3 was full with them and audio stuttered). "
+                     "No effect with the usual three cores")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++// sasrt-nx (2026-11-22, after base port 254 showed what a pinned compile does behind port 251's command stage on core 3:
++// in RR6 races one took 250-354 s): the shader compile threads (the uam thread and its spare-chunk thread, the pipeline
++// prebuild workers, the list writer, the cache saver) placed by this one key, the ring cleaner (not a compile) left to
++// banjo_system_core_compiles. The user: first "Let the shader compiles float around instead", then "Or restrict it to
++// core 2 actually": 2 by default (the game's core 2, as banjo_background_compile_core's default). -1: every core of the
++// process (with four cores, the system core too), no preferred core: the kernel places them (floating). -2: as before
++// (banjo_background_compile_core / banjo_system_core_compiles / banjo_system_core_uam).
++REXCVAR_DEFINE_INT32(sasrt_compile_threads_core, 2, "Banjo/Threads",
++                     "The shader compile threads' core (uam, the pipeline prebuild workers, the list writer, the cache "
++                     "saver): 0-3 pinned there (2: the user, 2026-11-22), -1 every core with no preferred one "
++                     "(floating), -2 as banjo_background_compile_core / banjo_system_core_compiles / "
++                     "banjo_system_core_uam place them")
++    .range(-2, 3)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ // banjo-nx (2026-10-28, the user's request): the uam thread alone on the system core, with the background compiles held
+ // to banjo_deko3d_background_compile_share (10 %) by their rests. The pipeline prebuild workers (bursts at area loads,
+ // banjo_system_core_compiles) stay off it.
+ // Port 254 (2026-11-22, the user to rr6-nx: "Compile on core 2"): off by default. Port 251's command stage (0x2E) and
+ // warm helper (0x2F) keep the system core busy in play, above this thread (0x3B): in RR6 races a compile there took
+ // 250-354 s and the prebuild waiting on it held every specialised pipeline back (GPU +1.2 ms); on core 2, 169 ms.
++// sasrt-nx: app/sasrt_switch.toml already had it false (the user's choice), so no change in SASRT's behaviour.
+ REXCVAR_DEFINE_BOOL(banjo_system_core_uam, false, "Banjo/Threads",
+                     "When the process has the system core (four cores granted, banjo_system_core 1 or 2): the uam "
+                     "shader compile thread runs there (at the lowest priority an application gets, so the audio "
+                     "threads there go first; its background compiles rest to banjo_deko3d_background_compile_share of "
+@@ -1892,9 +1971,40 @@
+     if (system_core >= 0) return system_core;
+   }
+   return REXCVAR_GET(banjo_background_compile_core);
+ }
++#if REX_PLATFORM_SWITCH
++// sasrt-nx (2026-11-22, sasrt_compile_threads_core -1): the calling thread on every core of the process (the system
++// core kept in the mask: RexSwitchSetCurrentThreadCoresWithSystem), no preferred core.
++static bool FloatCurrentThread() {
++  return RexSwitchSetCurrentThreadCoresWithSystem(-1, RexSwitchProcessCoreMask());
++}
++static void FloatCompileThread() {
++  const bool ok = FloatCurrentThread();
++  REXLOG_INFO("[renut] uam thread floats: every core of the process (mask 0x{:X}){} (sasrt_compile_threads_core -1)",
++              RexSwitchProcessCoreMask(), ok ? "" : " (NOT accepted)");
++}
++// The compile threads' place by sasrt_compile_threads_core (>= 0 pinned, -1 floating); false for -2 (the old keys).
++static bool PlaceCompileThreadByKey() {
++  const int32_t core = REXCVAR_GET(sasrt_compile_threads_core);
++  if (core == -1)
++    return FloatCurrentThread();
++  if (core >= 0)
++    return RexSwitchPinCurrentThreadToCore(int(core));
++  return false;
++}
++#endif
++void (*Deko3DCompileThreadPlacer())() {
++#if REX_PLATFORM_SWITCH
++  if (REXCVAR_GET(sasrt_compile_threads_core) == -1)  // floating; a pinned core goes through compileCore
++    return &FloatCompileThread;
++#endif
++  return nullptr;
++}
+ int Deko3DCompileCore() {
++  // sasrt-nx (2026-11-22): sasrt_compile_threads_core (-1: placed by Deko3DCompileThreadPlacer; -2: the keys below)
++  if (REXCVAR_GET(sasrt_compile_threads_core) != -2)
++    return REXCVAR_GET(sasrt_compile_threads_core);
+   // banjo-nx (2026-10-28): the uam thread on the system core when there is one (banjo_system_core_uam).
+   if (REXCVAR_GET(banjo_system_core_uam)) {
+     const int system_core = RexSwitchSystemCore();
+     if (system_core >= 0)
+@@ -2481,8 +2612,20 @@
+ int BackgroundThreadPriority() { return kBackgroundPriority; }  // blur-nx (2026-11-18, #11)
+ void OnBackgroundThreadStart(const char *what) {
+ #if REX_PLATFORM_SWITCH
+   const bool priority_ok = RexSwitchSetCurrentThreadPriorityOk(kBackgroundPriority);
++  // sasrt-nx (2026-11-22): the compile threads by sasrt_compile_threads_core; the ring cleaner (not a compile) stays
++  // where banjo_system_core_compiles places it
++  if (REXCVAR_GET(sasrt_compile_threads_core) != -2 && std::string_view(what) != "ring cleaner") {
++    const int32_t key_core = REXCVAR_GET(sasrt_compile_threads_core);
++    const bool place_ok = PlaceCompileThreadByKey();
++    REXLOG_INFO("[renut] {} at priority 0x{:X}{}, {}{} (sasrt_compile_threads_core)", what, kBackgroundPriority,
++                priority_ok ? "" : " (NOT accepted)",
++                key_core < 0 ? fmt::format("floating on every core of the process (mask 0x{:X})", RexSwitchProcessCoreMask())
++                             : fmt::format("pinned to core {}", key_core),
++                place_ok ? "" : " (NOT accepted)");
++    return;
++  }
+   const int32_t core = BackgroundCore();  // banjo-nx (2026-10-27): the system core when there is one
+   const bool core_ok = core < 0 || RexSwitchPinCurrentThreadToCore(int(core));
+   REXLOG_INFO("[renut] {} at priority 0x{:X}{}, {} (banjo_background_compile_core / banjo_system_core_compiles)",
+               what, kBackgroundPriority,
+@@ -2637,9 +2780,11 @@
+   g_saver.thread = std::thread([] {
+ #if REX_PLATFORM_SWITCH
+     (void)RexSwitchSetCurrentThreadPriorityOk(kBackgroundPriority);
+     const int32_t core = REXCVAR_GET(banjo_background_compile_core);
+-    if (core >= 0)
++    if (REXCVAR_GET(sasrt_compile_threads_core) != -2)  // sasrt-nx (2026-11-22)
++      (void)PlaceCompileThreadByKey();
++    else if (core >= 0)
+       (void)RexSwitchPinCurrentThreadToCore(int(core));
+ #endif
+     std::unique_lock lock(g_saver.mutex);
+     // banjo_renut_cache_save_quiet (package 28): a save once the compiling has stopped for 15 s (a level loaded, a
+--- base/app/src/renut_engine/gpu/banjo_renut_tuning.h
++++ sasrt-nx/app/src/renut_engine/gpu/banjo_renut_tuning.h
+@@ -393,8 +397,11 @@
+ // banjo_deko3d_uam_wide_rows); 1471 by default.
+ unsigned Deko3DUamFlags();
+ // banjo_background_compile_core / banjo_deko3d_compile_priority (2026-10-18): the uam thread's core and priority.
+ int Deko3DCompileCore();
++// sasrt-nx (2026-11-22, sasrt_compile_threads_core -1): what places the uam thread (every core of the process), or null
++// (then it is pinned to Deko3DCompileCore(), -1 none).
++void (*Deko3DCompileThreadPlacer())();
+ int Deko3DCompilePriority();
+ int Deko3DBackgroundCompileShare();  // banjo_deko3d_background_compile_share (2026-10-23)
+ bool Deko3DCompileWaitBoostOn();  // banjo_deko3d_compile_wait_boost (2026-10-23)
+ bool Deko3DFastFirstCompileOn();  // banjo_deko3d_fast_first_compile (port 56, from mk9-nx)
+--- base/app/src/renut_engine/gpu/banjo_renut_deko3d.cpp
++++ sasrt-nx/app/src/renut_engine/gpu/banjo_renut_deko3d.cpp
+@@ -633,17 +642,19 @@
+   options.swapInterval = uint32_t(std::clamp<int32_t>(REXCVAR_GET(banjo_deko3d_swap_interval), 1, 4));  // port 165
+   options.asyncVariants = Deko3DAsyncVariantsOn();  // banjo-nx (2026-10-21)
+   // The uam thread on the background compile core, below the game's threads (2026-10-18).
+   options.compileCore = Deko3DCompileCore();
++  options.placeCompileThread = Deko3DCompileThreadPlacer();  // sasrt-nx (2026-11-22): sasrt_compile_threads_core -1
+   options.compilePriority = Deko3DCompilePriority();
+   options.backgroundCompileShare = Deko3DBackgroundCompileShare();  // 2026-10-23
+   options.compileWaitBoost = Deko3DCompileWaitBoostOn();  // 2026-10-23
+   options.fastFirstCompile = Deko3DFastFirstCompileOn();  // port 56 (mk9-nx)
+   options.asyncCacheReads = Deko3DAsyncCacheReadsOn();     // 2026-10-23
+   options.userClipEnable = Deko3DUserClipEnable();  // renut-ultimate, from rr6-nx (2026-11-05)
+   options.depthResolve = Deko3DDepthResolveOn();  // sasrt-nx (2026-10-21)
+-  options.depthResolveLazy = Deko3DDepthResolveLazyOn();  // renut-ultimate (2026-11-08)
+   options.diagBarriers = REXCVAR_GET(sasrt_deko3d_diag_barriers);  // sasrt-nx (2026-11-08)
++  // renut-ultimate (2026-11-08); sasrt-nx (2026-11-13, base port 45): off here by default (ultimate.cpp).
++  options.depthResolveLazy = Deko3DDepthResolveLazyOn();
+   options.descriptorCache = REXCVAR_GET(lo_deko3d_descriptor_cache);                       // port 59
+   options.relaxedDescriptorCounters = REXCVAR_GET(lo_deko3d_relaxed_descriptor_counters);  // port 59
+   plume::Deko3DSetOptions(options);
+   sasrt::gpu_round::ApplyPlume();  // sasrt-nx (2026-11-08): the GPU round's items in plume (preciseDepthResolve)
+--- base/app/thirdparty/plume/plume_deko3d.h
++++ sasrt-nx/app/thirdparty/plume/plume_deko3d.h
+@@ -1234,8 +1261,12 @@
+         bool logMisses = false;
+         // The uam thread's core (-1: any) and priority (Horizon: a higher number is a lower priority; 0: unchanged).
+         // A thread that waits for a compile lends its priority to the uam thread while it waits.
+         int compileCore = -1;
++        // sasrt-nx (2026-11-22, the user: "let the shader compiles float around instead"): when set, the uam thread and its
++        // spare-chunk thread are placed by this (the app's: every core of the process, no preferred core: the kernel
++        // puts them where there is room) instead of being pinned to compileCore.
++        void (*placeCompileThread)() = nullptr;
+         int compilePriority = 0;
+         // banjo-nx (2026-10-23): the share of its core (percent) background compiles may use: after each one the uam
+         // thread rests in proportion (a compile a thread waits for ends the rest). An application's lowest priority
+         // is the game threads' own (0x3B), so a lower one for the uam thread is refused and it shared the core half
+--- base/app/thirdparty/plume/plume_deko3d.cpp
++++ sasrt-nx/app/thirdparty/plume/plume_deko3d.cpp
+@@ -1635,9 +1712,11 @@
+ 
+     void Deko3DDevice::spareWorker() {
+         // The uam thread's place: off the render thread's core, below the game's threads (the priority the process
+         // allows at or above the asked one, as compileWorker takes it).
+-        if (g_deko3dOptions.compileCore >= 0)
++        if (g_deko3dOptions.placeCompileThread)  // sasrt-nx (2026-11-22): the compiles float (see the option)
++            g_deko3dOptions.placeCompileThread();
++        else if (g_deko3dOptions.compileCore >= 0)
+             svcSetThreadCoreMask(CUR_THREAD_HANDLE, g_deko3dOptions.compileCore, 1u << g_deko3dOptions.compileCore);
+         s32 asked = g_deko3dOptions.compilePriority, priority = -1;
+         if (asked > 0) {
+             u64 allowed = 0;
+@@ -2098,9 +2183,11 @@
+         {
+             std::lock_guard<std::mutex> lock(compileMutex);  // compile() reads it under the lock
+             compileThreadHandle = threadGetCurHandle();
+         }
+-        if (g_deko3dOptions.compileCore >= 0)
++        if (g_deko3dOptions.placeCompileThread)  // sasrt-nx (2026-11-22): the compiles float (see the option)
++            g_deko3dOptions.placeCompileThread();
++        else if (g_deko3dOptions.compileCore >= 0)
+             svcSetThreadCoreMask(CUR_THREAD_HANDLE, g_deko3dOptions.compileCore, 1u << g_deko3dOptions.compileCore);
+         // banjo-nx (2026-10-23): the priority the process may give (the console's profile showed this thread at 0x3B in
+         // every report: 0x3E is below an application's lowest, the game threads' 0x3B, and the kernel refused it while
+         // the log said 0x3E). The asked one, or the lowest allowed above it; what the kernel took is logged.

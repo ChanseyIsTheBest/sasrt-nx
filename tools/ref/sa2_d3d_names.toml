@@ -1,0 +1,43 @@
+# Named XDK Direct3D functions of Sonic Adventure 2 (XBLA, title 58411202, XDK 2.0.21076): the reference for
+# tools/d3d_match.py in this port (Sonic & All-Stars Racing Transformed links XDK 2.0.21119, the closest version
+# available). From sa2-nx docs/sa2-notes.md "Named D3D functions" and its d3d_match run against Banjo-Kazooie: Nuts &
+# Bolts (score >= 0.85, or confirmed by call alignment / by being the only caller of a kernel export). Addresses only.
+[functions]
+0x82563AB0 = { name = "D3DDevice_Clear" }
+0x82549808 = { name = "D3DDevice_CreateIndexBuffer" }
+0x8255E568 = { name = "D3DDevice_CreatePixelShader" }
+0x82548F18 = { name = "D3DDevice_CreateSurface" }
+0x82548DF8 = { name = "D3DDevice_CreateTexture" }
+0x82549730 = { name = "D3DDevice_CreateVertexBuffer" }
+0x8255E198 = { name = "D3DDevice_CreateVertexDeclaration" }
+0x8255E750 = { name = "D3DDevice_CreateVertexShader" }
+0x82566078 = { name = "D3DDevice_DrawIndexedVertices" }
+0x82565C60 = { name = "D3DDevice_DrawVertices" }
+0x82565C18 = { name = "D3DDevice_DrawVerticesUP" }
+0x82565758 = { name = "D3DDevice_BeginVertices" }
+0x8254F8C8 = { name = "D3DDevice_ReleaseThreadOwnership" }
+0x82553490 = { name = "D3DDevice_SetScreenExtentQueryMode" }
+0x82558E98 = { name = "D3DDevice_Swap" }
+0x825645A0 = { name = "D3DDevice_Resolve" }
+0x825576D0 = { name = "D3DDevice_BeginTiling" }
+0x82557A40 = { name = "D3DDevice_EndTiling" }
+0x825527D8 = { name = "D3DDevice_SetGammaRamp" }
+0x8254EF40 = { name = "D3DDevice_SetRingBufferParameters" }
+0x8255E218 = { name = "D3DDevice_SetShaderGPRAllocation" }
+0x8254EE70 = { name = "D3DDevice_BlockUntilIdle" }
+0x8254FC10 = { name = "Direct3D_CreateDevice" }
+0x82549B10 = { name = "D3DIndexBuffer_Lock" }
+0x82548C40 = { name = "D3DLineTexture_LockRect" }
+0x82549650 = { name = "D3DResource_AddRef" }
+0x8254A200 = { name = "D3DResource_Destroy" }
+0x82549358 = { name = "D3DResource_GetType" }
+0x8254A4A8 = { name = "D3DResource_Release" }
+0x825490E8 = { name = "D3DSurface_LockRect" }
+0x8254AA08 = { name = "D3DVertexBuffer_Lock" }
+0x825497F8 = { name = "D3DVertexBuffer_Unlock" }
+0x82556A60 = { name = "D3D_DrawTimeShaderLoad" }
+0x8254DC00 = { name = "D3D_KickOff_CP_RB_WPTR" }
+0x8254D340 = { name = "D3D_KickOff2_CP_RB_WPTR" }
+0x8254D420 = { name = "D3D_InterruptCallback" }
+0x82557FC0 = { name = "D3D_Flip_PrimarySurface" }
+0x825580F0 = { name = "D3D_DisplaySetup" }

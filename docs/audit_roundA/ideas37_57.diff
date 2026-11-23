@@ -1,0 +1,270 @@
+--- a/tools/localize_native.py
++++ b/tools/localize_native.py
+@@ -75,6 +75,90 @@
+ HOT_SHARDS = 6
+ HOT_SAMPLES = int(os.environ.get('SASRT_HOT_SAMPLES', '3'))
+ HOT_CLOSURE_SAMPLES = int(os.environ.get('SASRT_HOT_CLOSURE_SAMPLES', '20'))  # machine-copy idea 33 (localize)
++# sasrt-nx (2026-11-11, machine-copy idea 37): a copy writes back at a return only the registers a caller can read:
++# tools/leaf_dead_stores.py's LiveOut of the function (whole program, no ABI assumption: the 360 compiler allocates
++# registers across functions), plus r1, r2, r13, r3 and f1 and every non-volatile one, as leaf_dead_stores.py's own
++# rule. The original writes them; the guard does not compare them (kSkip). SASRT_LOCALIZE_LIVE_OUT=0: every changed
++# register written back, as before.
++LIVE_OUT = os.environ.get('SASRT_LOCALIZE_LIVE_OUT', '1') != '0'
++LIVE_OUT_JSON = os.path.join(ROOT, 'out', 'leaf_live_out.json')
++_live_out = None
++
++
++def live_out_keep(name):
++    """None (keep every register) or a predicate on register names for the function's return write-backs."""
++    global _live_out
++    if not LIVE_OUT:
++        return None
++    if _live_out is None:
++        try:
++            _live_out = {int(k, 16): v for k, v in json.load(open(LIVE_OUT_JSON)).items()}
++        except (OSError, ValueError):
++            _live_out = {}
++    m = re.match(r'^(?:__imp__)?sub_([0-9A-F]{8})$', name)
++    mask = _live_out.get(int(m.group(1), 16)) if m else None
++    if mask is None or mask == (1 << 64) - 1:
++        return None
++
++    def keep(reg):
++        k = re.match(r'^([rf])(\d+)$', reg)
++        if not k:
++            return True
++        n = int(k.group(2))
++        if k.group(1) == 'r':
++            if n in (1, 2, 3, 13) or n > 12:
++                return True
++            return bool(mask >> n & 1)
++        if n == 1 or n > 13:
++            return True
++        return bool(mask >> (32 + n) & 1)
++    return keep
++
++
++# sasrt-nx (2026-11-11, machine-copy idea 57): `stvlx v, E` straight followed by `stvrx v, Y` of the same vector (the
++# unaligned 16-byte store idiom) is one 16-byte store at E when Y == E + 16, which the copy checks at run time (the
++# original pair otherwise). SASRT_LOCALIZE_STV_PAIRS=0: off.
++STV_PAIRS = os.environ.get('SASRT_LOCALIZE_STV_PAIRS', '1') != '0'
++STV_EA = re.compile(r'^\tea = ([\w.]+(?: \+ [\w.]+)?);$')
++STV_L = re.compile(r'^\tif \(s\.Note\(\(u32\)\(ea\), 16u - \(\(u32\)\(ea\) & 0xFu\)\)\) '
++                   r'REX_STVLX\(ea, (l_v\d+|ctx\.v\d+)\);$')
++STV_R = re.compile(r'^\tif \(s\.Note\(\(u32\)\(ea\) & ~0xFu, \(u32\)\(ea\) & 0xFu\)\) '
++                   r'REX_STVRX\(ea, (l_v\d+|ctx\.v\d+)\);$')
++STV_STOP = '\tif (s.Stopped()) return;'
++stv_pairs_merged = 0
++
++
++def merge_stv_pairs(body):
++    """Idea 57 on one copy's (text, block) lines."""
++    global stv_pairs_merged
++    if not STV_PAIRS:
++        return body
++    out = []
++    i = 0
++    while i < len(body):
++        t = [x[0] for x in body[i:i + 5]]
++        ml = STV_L.match(t[0]) if len(t) == 5 else None
++        me = STV_EA.match(t[2]) if ml else None
++        mr = STV_R.match(t[3]) if me else None
++        if (mr and t[1] == STV_STOP and t[4] == STV_STOP and ml.group(1) == mr.group(1)
++                and not re.search(r'\bea\b', me.group(1)) and len({b for _, b in body[i:i + 5]}) == 1):
++            v, y, blk = ml.group(1), me.group(1), body[i][1]
++            out += [(f'\t{{ const u32 rex_ea2 = (u32)({y});', blk),
++                    ('\tif (rex_ea2 == (u32)ea + 16u) {', blk),
++                    (f'\tif (s.Note((u32)(ea), 16u)) REX_STV16(ea, {v});', blk),
++                    (STV_STOP, blk),
++                    ('\tea = rex_ea2;', blk),
++                    ('\t} else {', blk)]
++            out += body[i:i + 5]
++            out.append(('\t} }', blk))
++            stv_pairs_merged += 1
++            i += 5
++            continue
++        out.append(body[i])
++        i += 1
++    return out
++
++
+ BULK_SLOT = 9999  # past PPCContext::host_counters: the guard's countdown is the hook's own (banjo_hot_guest.h)
+ # sasrt-nx (2026-11-08): the first slots belong to the hooks of app/src/hot/sasrt_hot_guest.cpp (the CRT and Direct3D
+ # natives, slots given at their first call, at most sasrt::hot::kCtxSlots = 8); the localized list's hooks follow.
+@@ -1009,6 +1093,7 @@
+     forced -= set(hand)
+ 
+     declarations = []
++    dead_out = set()  # machine-copy idea 37: (member, register) write-backs LiveOut leaves out
+     # Blocks: straight runs of statements. A block starts at a function's first statement, at every label and after
+     # every statement that can leave (a jump, a return, the end of a switch). The Counting policy counts their
+     # entries; the map says which lines of this header and of the generated file each block holds.
+@@ -1022,6 +1107,9 @@
+         text = '\n'.join(lines)
+         regs = funcs[name]['regs']
+         written = funcs[name]['written']
++        keep_out = live_out_keep(name)  # machine-copy idea 37
++        if keep_out is not None:
++            dead_out.update((name, r) for r in written if not keep_out(r))
+         for m in PROMOTED.finditer(text):
+             externs.add(m.group(1))
+         dirty, writes, dirty_end = dirty_sets(name, lines, lambda l: [call_reach(m)[0] for m in CALL.finditer(l)])
+@@ -1044,6 +1132,9 @@
+                 # What can be dirty when this statement's call or return runs (an unreached statement: everything).
+                 here = sorted(written if dirty[at] is None else (dirty[at] | writes[at]), key=order)
+                 sync_out = ''.join(f'ctx.{r} = l_{r}; ' for r in here)
++                # (Idea 37: a return writes back only what a caller can read; a call still gets `here`.)
++                sync_ret = (sync_out if keep_out is None else
++                            ''.join(f'ctx.{r} = l_{r}; ' for r in here if keep_out(r)))
+                 if localized:
+                     if LABEL.match(l):
+                         block = blocks
+@@ -1070,14 +1161,15 @@
+                 l, stores = store_line(l)
+                 l = atomic_stop(l)  # sasrt-nx (2026-11-10): see ATOMICS
+                 l = CALL.sub(lambda m: call_text(m, name, regs, here, localized), l)
+-                if localized and sync_out:
++                if localized and sync_ret:
+                     # Braces: the generated code also writes a return as the body of a one-line `if`.
+                     l = RETURN.sub(lambda m: m.group(0) if 'if (s.' in l[max(0, m.start() - 24):m.start()]
+-                                   else '{ ' + sync_out + 'return; }', l)
++                                   else '{ ' + sync_ret + 'return; }', l)
+                 body.append((l, block))
+                 if stores:
+                     body.append(('\tif (s.Stopped()) return;', block))
+             if localized:
++                body = merge_stv_pairs(body)  # machine-copy idea 57
+                 how = ('[[gnu::always_inline]] static inline' if name in forced
+                        else '[[gnu::noinline, gnu::cold]] static' if name in hand else 'static')
+                 head = (f'template <class S>\n{how} '
+@@ -1089,6 +1181,8 @@
+                     block_of_line.append((f'\t{type_of(r)} l_{r} = ctx.{r};', entry_block[name]))
+                 block_of_line.extend(body)
+                 end = sorted(written if dirty_end is None else dirty_end, key=order)
++                if keep_out is not None:
++                    end = [r for r in end if keep_out(r)]  # idea 37
+                 if end and not (numbered and ONLY_RETURN.match(numbered[-1][1])):
+                     block_of_line.append(('\t' + ' '.join(f'ctx.{r} = l_{r};' for r in end), block))
+                 block_of_line.append(('}', block))
+@@ -1126,6 +1220,9 @@
+     for m in members:
+         for line in index.raw(m):
+             skip |= set(LEAF_DEAD.findall(line))
++    # sasrt-nx (2026-11-11, machine-copy idea 37): the write-backs left out by LiveOut (any member's: a member's
++    # register the root never mentions stays as it came into the hook).
++    skip |= {r for m, r in dead_out if m in members}
+     entry = (f'if (!::banjo::hand::n_{hand[root]["id"]}::Native(ctx, base, s)) f_{root}(ctx, base, s);'
+              if root in hand else f'f_{root}(ctx, base, s);')
+     hand_note = ('' if not hand_members else
+--- a/tools/leaf_dead_stores.py
++++ b/tools/leaf_dead_stores.py
+@@ -378,6 +378,13 @@
+     return out
+ 
+ 
++COPY_LISTS = {os.path.normcase(os.path.join(ROOT, 'app', 'src', 'cpu', 'hot', n))
++              for n in ('localized.txt', 'localized_bulk.txt')}
++# sasrt-nx (2026-11-11, machine-copy idea 37): every function's LiveOut, for tools/localize_native.py (a copy writes back
++# at a return only the volatile registers a caller can read).
++LIVE_OUT_JSON = os.path.join(ROOT, 'out', 'leaf_live_out.json')
++
++
+ def address_taken(gen, image, starts, bodies):
+     pch = open(glob.glob(os.path.join(gen, '*_pch.h'))[0], encoding='utf-8').read()
+     value = lambda name: int(re.search(r'#define %s (0x[0-9A-Fa-f]+)' % name, pch).group(1), 16)
+@@ -424,6 +431,14 @@
+         paths = [root] if os.path.isfile(root) else [os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs
+                                                       if f.endswith(('.cpp', '.h', '.hpp', '.inc', '.c', '.toml', '.txt'))]
+         for path in paths:
++            # sasrt-nx (2026-11-11, machine-copy idea 37): the localized copies' own lists (tools/localize_native.py)
++            # name functions without calling them: a copy's hook runs for the same direct callers, the copy or the
++            # original. Counting them made every listed function "everything live", so a function lost its dead
++            # write-backs (and dead_ctx_defs.py's dead definitions) when it became a copy, and the generated tree
++            # changed with the list. SASRT_LIVE_OUT_LISTS_NAMED=1: counted again.
++            if (os.environ.get('SASRT_LIVE_OUT_LISTS_NAMED', '0') != '1' and
++                    os.path.normcase(os.path.abspath(path)) in COPY_LISTS):
++                continue
+             try:
+                 text = open(path, encoding='utf-8', errors='ignore').read()
+             except OSError:
+@@ -644,6 +659,13 @@
+             why['everything live after a call site'] += 1
+     print('  leaf functions: ' + ', '.join('%s %d' % kv for kv in why.most_common()))
+ 
++    # sasrt-nx (2026-11-11, machine-copy idea 37): the LiveOut of every function, for the copies (written in --check
++    # runs too: it is the analysis, not a rewrite).
++    import json
++    with open(LIVE_OUT_JSON + '.tmp', 'w') as f:
++        json.dump({'%08X' % addr: live_out[addr] for addr in sorted(live_out)}, f)
++    os.replace(LIVE_OUT_JSON + '.tmp', LIVE_OUT_JSON)
++
+     # 4. The leaf write-backs.
+     stores = dead = funcs_with = 0
+     by_reg = collections.Counter()
+--- a/tools/store_cards.py
++++ b/tools/store_cards.py
+@@ -38,7 +38,7 @@
+ import sys
+ 
+ R1 = re.compile(r'(?<![\w.])(?:ctx\.r1|r1l|l_r1|ll_r1|r1)\.[us](?:32|64)\b')
+-STORE = re.compile(r'\b(REX_STORE_D_U(?:8|16|32|64)|REX_STORE_U(?:8|16|32|64)|REX_STVLX|REX_STVRX|'
++STORE = re.compile(r'\b(REX_STORE_D_U(?:8|16|32|64)|REX_STORE_U(?:8|16|32|64)|REX_STVLX|REX_STVRX|REX_STV16|'
+                    r'REX_MM_STORE_U(?:8|16|32|64)|BANJO_HOT_STORE_(?:D_)?U(?:8|16|32|64))\(')
+ VEC = 'simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(ea),'
+ DCBZ = re.compile(r'(?<![\w,] )\bmemset\(\(void\*\)REX_RAW_ADDR\(ea\), 0, (?:32|128)\);')
+@@ -69,6 +69,7 @@
+ #define REX_STORE_U64_C(x, y) (REX_STORE_U64(x, y), REX_CARD(x))
+ #define REX_STVLX_C(ea, v) do { REX_STVLX(ea, v); REX_CARD(ea); } while (0)
+ #define REX_STVRX_C(ea, v) do { REX_STVRX(ea, v); REX_CARD(ea); } while (0)
++#define REX_STV16_C(ea, v) do { REX_STV16(ea, v); REX_CARD(ea); REX_CARD((u32)(ea) + 15u); } while (0)
+ #define REX_MM_STORE_U8_C(a, v) do { REX_MM_STORE_U8(a, v); REX_CARD(a); } while (0)
+ #define REX_MM_STORE_U16_C(a, v) do { REX_MM_STORE_U16(a, v); REX_CARD(a); } while (0)
+ #define REX_MM_STORE_U32_C(a, v) do { REX_MM_STORE_U32(a, v); REX_CARD(a); } while (0)
+@@ -164,7 +165,7 @@
+ 
+ 
+ UNDO = [
+-    (re.compile(r'\b(REX_STORE_D_U(?:8|16|32|64)|REX_STORE_U(?:8|16|32|64)|REX_STVLX|REX_STVRX|'
++    (re.compile(r'\b(REX_STORE_D_U(?:8|16|32|64)|REX_STORE_U(?:8|16|32|64)|REX_STVLX|REX_STVRX|REX_STV16|'
+                 r'REX_MM_STORE_U(?:8|16|32|64)|BANJO_HOT_STORE_(?:D_)?U(?:8|16|32|64))_C\('), r'\1('),
+     (re.compile(r'REX_CARD\(ea\), (?=simde_mm_store_si128|memset\()'), ''),
+     (re.compile(r'REX_GUEST_CAS_C\(ea, '), 'REX_GUEST_CAS('),
+@@ -190,7 +191,8 @@
+     ap.add_argument('--restore', action='store_true', help='put the plain stores back (and drop the macros)')
+     ap.add_argument('--check', action='store_true', help='count only, write nothing')
+     a = ap.parse_args()
+-    counts = {k: 0 for k in ('REX_STORE_D', 'REX_STORE', 'REX_STVLX', 'REX_STVRX', 'REX_MM_STORE', 'BANJO_HOT',
++    counts = {k: 0 for k in ('REX_STORE_D', 'REX_STORE', 'REX_STVLX', 'REX_STVRX', 'REX_STV16', 'REX_MM_STORE',
++                             'BANJO_HOT',
+                              'vector', 'dcbz', 'cas', 'stack')}
+     changed = 0
+     for path in files(a.gen, a.hot):
+--- a/app/src/cpu/banjo_hot_prelude.h
++++ b/app/src/cpu/banjo_hot_prelude.h
+@@ -7,4 +7,9 @@
+ #include "../../generated/default/sasrt_pch.h"
+ 
+ #include "cpu/banjo_hot_guest.h"
++// sasrt-nx (2026-11-11, machine-copy idea 57): the merged stvlx / stvrx pair of tools/localize_native.py (copies only;
++// tools/store_cards.py's REX_STV16_C marks both pages the 16 bytes can touch).
++#ifndef REX_STV16
++#define REX_STV16(ea, v) rex::ppc::StoreVector16(REX_RAW_ADDR(ea), (v).u8)
++#endif
+ #include "cpu/hot/banjo_hand_natives.h"
+--- a/sdk/include/rex/ppc/vec_unaligned.h
++++ b/sdk/include/rex/ppc/vec_unaligned.h
+@@ -30,6 +30,14 @@
+   for (int j = 0; j < 16; ++j) b[j] = in[15 - j];
+ }
+ 
++/// sasrt-nx (2026-11-11, machine-copy idea 57): an stvlx at ea and an stvrx at ea + 16 of the same vector store the
++/// vector's 16 guest bytes at ea: one unaligned store (tools/localize_native.py checks ea + 16 at run time).
++[[gnu::always_inline]] inline void StoreVector16(uint8_t* host, const uint8_t* u8) noexcept {
++  uint8_t b[16];
++  GuestBytes(u8, b);
++  __builtin_memcpy(host, b, 16);
++}
++
+ /// 1 <= n <= 16 bytes from s to d, at most five stores.
+ [[gnu::always_inline]] inline void StoreBytes(uint8_t* d, const uint8_t* s, uint32_t n) noexcept {
+   if (n == 16) {

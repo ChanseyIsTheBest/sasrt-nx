@@ -1,0 +1,346 @@
+# Sonic & All-Stars Racing Transformed (XDK 2.0.21119): reNut's Direct3D names at this game's addresses
+# (tools: shape map against sa2-nx, N&B name matching, call-graph propagation, the state tables at
+# 0x831702C0 / 0x83170780; docs/deko3d-renderer.md).
+[functions]
+0x82CB7A78 = { name = "XMemFree" }  # call graph via CreateVertexShader, Destroy; the thunk 0x823DB5F0
+0x82CD4B68 = { name = "D3DArrayTexture_GetArraySize" }  # shape match, checked
+0x82CD7628 = { name = "D3DArrayTexture_LockRect" }  # shape match, checked
+0x82CD4B20 = { name = "D3DArrayTexture_UnlockRect" }  # shape match, checked
+0x82CD6F58 = { name = "D3DBaseTexture_GetLevelCount" }  # shape match, checked
+0x82CE4050 = { name = "D3DConstantBuffer_Unlock" }  # shape match, checked
+0x82CD7550 = { name = "D3DCubeTexture_GetCubeMapSurface" }  # shape match, checked
+0x82CD3BE8 = { name = "D3DDevice_AcquireThreadOwnership" }  # shape match, checked
+0x82CEB850 = { name = "D3DDevice_BeginCommandBuffer" }  # shape match, checked
+0x82CE4768 = { name = "D3DDevice_BeginExport" }  # shape match, checked
+0x82CE7868 = { name = "D3DDevice_BeginTiling" }  # confirmed
+0x82CD0BB8 = { name = "D3DDevice_BeginVertices" }  # confirmed
+0x82CDDC28 = { name = "D3DDevice_BlockOnFence" }  # shape match, checked
+0x82CDFB60 = { name = "D3DDevice_BlockUntilIdle" }  # confirmed
+0x82CE71B0 = { name = "D3DDevice_Clear" }  # confirmed
+0x82CE7038 = { name = "D3DDevice_ClearF" }  # call graph via D3DDevice_Clear
+0x82CE3F80 = { name = "D3DDevice_CreateIndexBuffer" }  # confirmed
+0x82CC61F0 = { name = "D3DDevice_CreatePixelShader" }  # confirmed
+0x82CD7AD8 = { name = "D3DDevice_CreateSurface" }  # confirmed
+0x82CD7978 = { name = "D3DDevice_CreateTexture" }  # confirmed
+0x82CE3D90 = { name = "D3DDevice_CreateVertexBuffer" }  # confirmed
+0x82CC2F40 = { name = "D3DDevice_CreateVertexDeclaration" }  # confirmed
+0x82CC64E8 = { name = "D3DDevice_CreateVertexShader" }  # confirmed
+0x82CD1DB8 = { name = "D3DDevice_DrawIndexedVertices" }  # confirmed
+0x82CD18D0 = { name = "D3DDevice_DrawVertices" }  # confirmed
+0x82CD1168 = { name = "D3DDevice_DrawVerticesUP" }  # confirmed
+0x82CEFA78 = { name = "D3DDevice_EndCommandBuffer" }  # shape match, checked
+0x82CE4890 = { name = "D3DDevice_EndExport" }  # shape match, checked
+0x82CD0B78 = { name = "D3DDevice_EndIndexedVertices" }  # shape match, checked
+0x82CE8098 = { name = "D3DDevice_EndTiling" }  # confirmed
+0x82CCE948 = { name = "D3DDevice_GetDepthStencilSurface" }  # confirmed
+0x82CF1420 = { name = "D3DDevice_GetDeviceCaps" }  # shape match, checked
+0x82CF1C30 = { name = "D3DDevice_GetDisplayMode" }  # confirmed
+0x82CCBAA0 = { name = "D3DDevice_GetRenderState_AlphaBlendEnable" }  # state table Render 15
+0x82CCBF70 = { name = "D3DDevice_GetRenderState_AlphaFunc" }  # state table Render 26
+0x82CCBF18 = { name = "D3DDevice_GetRenderState_AlphaRef" }  # state table Render 25
+0x82CCB960 = { name = "D3DDevice_GetRenderState_AlphaTestEnable" }  # state table Render 24
+0x82CCD548 = { name = "D3DDevice_GetRenderState_AlphaToMaskEnable" }  # state table Render 84
+0x82CCD580 = { name = "D3DDevice_GetRenderState_AlphaToMaskOffsets" }  # state table Render 85
+0x82CCC030 = { name = "D3DDevice_GetRenderState_BlendFactor" }  # state table Render 17
+0x82CCBB48 = { name = "D3DDevice_GetRenderState_BlendOp" }  # state table Render 20
+0x82CCBD18 = { name = "D3DDevice_GetRenderState_BlendOpAlpha" }  # state table Render 23
+0x82CCC1A8 = { name = "D3DDevice_GetRenderState_Buffer2Frames" }  # state table Render 100
+0x82CCC468 = { name = "D3DDevice_GetRenderState_CCWStencilFail" }  # state table Render 36
+0x82CCC428 = { name = "D3DDevice_GetRenderState_CCWStencilFunc" }  # state table Render 39
+0x82CCC588 = { name = "D3DDevice_GetRenderState_CCWStencilMask" }  # state table Render 41
+0x82CCC4E0 = { name = "D3DDevice_GetRenderState_CCWStencilPass" }  # state table Render 38
+0x82CCC568 = { name = "D3DDevice_GetRenderState_CCWStencilRef" }  # state table Render 40
+0x82CCC5A8 = { name = "D3DDevice_GetRenderState_CCWStencilWriteMask" }  # state table Render 42
+0x82CCC4A8 = { name = "D3DDevice_GetRenderState_CCWStencilZFail" }  # state table Render 37
+0x82CCC608 = { name = "D3DDevice_GetRenderState_ClipPlaneEnable" }  # state table Render 43
+0x82CCC888 = { name = "D3DDevice_GetRenderState_ColorWriteEnable" }  # state table Render 53
+0x82CCC8D8 = { name = "D3DDevice_GetRenderState_ColorWriteEnable1" }  # state table Render 54
+0x82CCC928 = { name = "D3DDevice_GetRenderState_ColorWriteEnable2" }  # state table Render 55
+0x82CCC978 = { name = "D3DDevice_GetRenderState_ColorWriteEnable3" }  # state table Render 56
+0x82CCB8E8 = { name = "D3DDevice_GetRenderState_CullMode" }  # state table Render 14
+0x82CCC7C8 = { name = "D3DDevice_GetRenderState_DepthBias" }  # state table Render 52
+0x82CCBC98 = { name = "D3DDevice_GetRenderState_DestBlend" }  # state table Render 19
+0x82CCBE18 = { name = "D3DDevice_GetRenderState_DestBlendAlpha" }  # state table Render 22
+0x82CCD620 = { name = "D3DDevice_GetRenderState_DiscardBand_X" }  # state table Render 88
+0x82CCD658 = { name = "D3DDevice_GetRenderState_DiscardBand_Y" }  # state table Render 89
+0x82CCB920 = { name = "D3DDevice_GetRenderState_FillMode" }  # state table Render 13
+0x82CCD5B8 = { name = "D3DDevice_GetRenderState_GuardBand_X" }  # state table Render 86
+0x82CCD5F0 = { name = "D3DDevice_GetRenderState_GuardBand_Y" }  # state table Render 87
+0x82CCD4A8 = { name = "D3DDevice_GetRenderState_HalfPixelOffset" }  # state table Render 81
+0x82CCD738 = { name = "D3DDevice_GetRenderState_HiStencilEnable" }  # state table Render 90
+0x82CCD7A8 = { name = "D3DDevice_GetRenderState_HiStencilFunc" }  # state table Render 92
+0x82CCD7D0 = { name = "D3DDevice_GetRenderState_HiStencilRef" }  # state table Render 93
+0x82CCD770 = { name = "D3DDevice_GetRenderState_HiStencilWriteEnable" }  # state table Render 91
+0x82CCD688 = { name = "D3DDevice_GetRenderState_HiZEnable" }  # state table Render 96
+0x82CCD700 = { name = "D3DDevice_GetRenderState_HiZWriteEnable" }  # state table Render 97
+0x82CCD178 = { name = "D3DDevice_GetRenderState_HighPrecisionBlendEnable" }  # state table Render 77
+0x82CCD230 = { name = "D3DDevice_GetRenderState_HighPrecisionBlendEnable1" }  # state table Render 78
+0x82CCD2E8 = { name = "D3DDevice_GetRenderState_HighPrecisionBlendEnable2" }  # state table Render 79
+0x82CCD3A0 = { name = "D3DDevice_GetRenderState_HighPrecisionBlendEnable3" }  # state table Render 80
+0x82CCC0E8 = { name = "D3DDevice_GetRenderState_LastPixel" }  # state table Render 98
+0x82CCC140 = { name = "D3DDevice_GetRenderState_LineWidth" }  # state table Render 99
+0x82CCD420 = { name = "D3DDevice_GetRenderState_MaxTessellationLevel" }  # state table Render 59
+0x82CCD3D8 = { name = "D3DDevice_GetRenderState_MinTessellationLevel" }  # state table Render 58
+0x82CCC808 = { name = "D3DDevice_GetRenderState_MultiSampleAntiAlias" }  # state table Render 48
+0x82CCC838 = { name = "D3DDevice_GetRenderState_MultiSampleMask" }  # state table Render 49
+0x82CCC9E8 = { name = "D3DDevice_GetRenderState_PointSize" }  # state table Render 44
+0x82CCCAB8 = { name = "D3DDevice_GetRenderState_PointSizeMax" }  # state table Render 47
+0x82CCCA50 = { name = "D3DDevice_GetRenderState_PointSizeMin" }  # state table Render 45
+0x82CCC988 = { name = "D3DDevice_GetRenderState_PointSpriteEnable" }  # state table Render 46
+0x82CCD800 = { name = "D3DDevice_GetRenderState_PresentImmediateThreshold" }  # state table Render 95
+0x82CCD7E0 = { name = "D3DDevice_GetRenderState_PresentInterval" }  # state table Render 94
+0x82CCD4E0 = { name = "D3DDevice_GetRenderState_PrimitiveResetEnable" }  # state table Render 82
+0x82CCD518 = { name = "D3DDevice_GetRenderState_PrimitiveResetIndex" }  # state table Render 83
+0x82CCC618 = { name = "D3DDevice_GetRenderState_ScissorTestEnable" }  # state table Render 50
+0x82CCBEC8 = { name = "D3DDevice_GetRenderState_SeparateAlphaBlendEnable" }  # state table Render 16
+0x82CCC6E8 = { name = "D3DDevice_GetRenderState_SlopeScaleDepthBias" }  # state table Render 51
+0x82CCBBF0 = { name = "D3DDevice_GetRenderState_SrcBlend" }  # state table Render 18
+0x82CCBD98 = { name = "D3DDevice_GetRenderState_SrcBlendAlpha" }  # state table Render 21
+0x82CCC2C8 = { name = "D3DDevice_GetRenderState_StencilEnable" }  # state table Render 27
+0x82CCC378 = { name = "D3DDevice_GetRenderState_StencilFail" }  # state table Render 29
+0x82CCC338 = { name = "D3DDevice_GetRenderState_StencilFunc" }  # state table Render 32
+0x82CCC528 = { name = "D3DDevice_GetRenderState_StencilMask" }  # state table Render 34
+0x82CCC3F0 = { name = "D3DDevice_GetRenderState_StencilPass" }  # state table Render 31
+0x82CCC508 = { name = "D3DDevice_GetRenderState_StencilRef" }  # state table Render 33
+0x82CCC548 = { name = "D3DDevice_GetRenderState_StencilWriteMask" }  # state table Render 35
+0x82CCC3B8 = { name = "D3DDevice_GetRenderState_StencilZFail" }  # state table Render 30
+0x82CCD468 = { name = "D3DDevice_GetRenderState_TessellationMode" }  # state table Render 57
+0x82CCC300 = { name = "D3DDevice_GetRenderState_TwoSidedStencilMode" }  # state table Render 28
+0x82CCCFA0 = { name = "D3DDevice_GetRenderState_ViewportEnable" }  # state table Render 76
+0x82CCCE50 = { name = "D3DDevice_GetRenderState_Wrap0" }  # state table Render 60
+0x82CCCE60 = { name = "D3DDevice_GetRenderState_Wrap1" }  # state table Render 61
+0x82CCCEF0 = { name = "D3DDevice_GetRenderState_Wrap10" }  # state table Render 70
+0x82CCCF00 = { name = "D3DDevice_GetRenderState_Wrap11" }  # state table Render 71
+0x82CCCF10 = { name = "D3DDevice_GetRenderState_Wrap12" }  # state table Render 72
+0x82CCCF20 = { name = "D3DDevice_GetRenderState_Wrap13" }  # state table Render 73
+0x82CCCF30 = { name = "D3DDevice_GetRenderState_Wrap14" }  # state table Render 74
+0x82CCCF40 = { name = "D3DDevice_GetRenderState_Wrap15" }  # state table Render 75
+0x82CCCE70 = { name = "D3DDevice_GetRenderState_Wrap2" }  # state table Render 62
+0x82CCCE80 = { name = "D3DDevice_GetRenderState_Wrap3" }  # state table Render 63
+0x82CCCE90 = { name = "D3DDevice_GetRenderState_Wrap4" }  # state table Render 64
+0x82CCCEA0 = { name = "D3DDevice_GetRenderState_Wrap5" }  # state table Render 65
+0x82CCCEB0 = { name = "D3DDevice_GetRenderState_Wrap6" }  # state table Render 66
+0x82CCCEC0 = { name = "D3DDevice_GetRenderState_Wrap7" }  # state table Render 67
+0x82CCCED0 = { name = "D3DDevice_GetRenderState_Wrap8" }  # state table Render 68
+0x82CCCEE0 = { name = "D3DDevice_GetRenderState_Wrap9" }  # state table Render 69
+0x82CCC200 = { name = "D3DDevice_GetRenderState_ZEnable" }  # state table Render 10
+0x82CCC270 = { name = "D3DDevice_GetRenderState_ZFunc" }  # state table Render 11
+0x82CCC230 = { name = "D3DDevice_GetRenderState_ZWriteEnable" }  # state table Render 12
+0x82CCE8F0 = { name = "D3DDevice_GetRenderTarget" }  # confirmed
+0x82CCE148 = { name = "D3DDevice_GetSamplerState_AddressU" }  # state table Sampler 0
+0x82CCE1A8 = { name = "D3DDevice_GetSamplerState_AddressV" }  # state table Sampler 1
+0x82CCE208 = { name = "D3DDevice_GetSamplerState_AddressW" }  # state table Sampler 2
+0x82CCDE30 = { name = "D3DDevice_GetSamplerState_AnisotropyBias" }  # state table Sampler 15
+0x82CCE0D0 = { name = "D3DDevice_GetSamplerState_BorderColor" }  # state table Sampler 3
+0x82CCE2C8 = { name = "D3DDevice_GetSamplerState_HGradientExpBias" }  # state table Sampler 16
+0x82CCDB00 = { name = "D3DDevice_GetSamplerState_MagFilter" }  # state table Sampler 4
+0x82CCDBE8 = { name = "D3DDevice_GetSamplerState_MagFilterZ" }  # state table Sampler 10
+0x82CCDDB0 = { name = "D3DDevice_GetSamplerState_MaxAnisotropy" }  # state table Sampler 9
+0x82CCDFD0 = { name = "D3DDevice_GetSamplerState_MaxMipLevel" }  # state table Sampler 8
+0x82CCD900 = { name = "D3DDevice_GetSamplerState_MinFilter" }  # state table Sampler 5
+0x82CCD9F8 = { name = "D3DDevice_GetSamplerState_MinFilterZ" }  # state table Sampler 11
+0x82CCE068 = { name = "D3DDevice_GetSamplerState_MinMipLevel" }  # state table Sampler 13
+0x82CCDC48 = { name = "D3DDevice_GetSamplerState_MipFilter" }  # state table Sampler 6
+0x82CCDEF8 = { name = "D3DDevice_GetSamplerState_MipMapLodBias" }  # state table Sampler 7
+0x82CCE400 = { name = "D3DDevice_GetSamplerState_PointBorderEnable" }  # state table Sampler 19
+0x82CCDD18 = { name = "D3DDevice_GetSamplerState_SeparateZFilterEnable" }  # state table Sampler 12
+0x82CCE268 = { name = "D3DDevice_GetSamplerState_TrilinearThreshold" }  # state table Sampler 14
+0x82CCE330 = { name = "D3DDevice_GetSamplerState_VGradientExpBias" }  # state table Sampler 17
+0x82CCE390 = { name = "D3DDevice_GetSamplerState_WhiteBorderColorW" }  # state table Sampler 18
+0x82CCE758 = { name = "D3DDevice_GetStreamSource" }  # confirmed
+0x82CCE580 = { name = "D3DDevice_GetViewport" }  # shape match, checked
+0x82CDFBF0 = { name = "D3DDevice_InsertCallback" }  # call graph via D3DDevice_EndTiling
+0x82CDF800 = { name = "D3DDevice_IsFencePending" }  # shape match, checked
+0x82CDA3D0 = { name = "D3DDevice_Present" }  # confirmed
+0x82CD3C38 = { name = "D3DDevice_ReleaseThreadOwnership" }  # shape match, checked
+0x82CDB7C8 = { name = "D3DDevice_Resolve" }  # confirmed
+0x82CEFF70 = { name = "D3DDevice_RunCommandBuffer" }  # shape match, checked
+0x82CCEC50 = { name = "D3DDevice_SetClipPlane" }  # shape match, checked
+0x82CE9D40 = { name = "D3DDevice_SetCommandBufferPredication" }  # confirmed
+0x82CCF910 = { name = "D3DDevice_SetDepthStencilSurface" }  # shape match, checked
+0x82CCEA20 = { name = "D3DDevice_SetGammaRamp" }  # shape match, checked
+0x82CCE7F8 = { name = "D3DDevice_SetIndices" }  # shape match, checked
+0x82CCEB38 = { name = "D3DDevice_SetPWLGamma" }  # shape match, checked
+0x82CC28C8 = { name = "D3DDevice_SetPixelShader" }  # shape match, checked
+0x82CC2530 = { name = "D3DDevice_SetPixelShaderConstantB" }  # confirmed
+0x82CC26A8 = { name = "D3DDevice_SetPixelShaderConstantI" }  # confirmed
+0x82CE76A0 = { name = "D3DDevice_SetPredication" }  # confirmed
+0x82CCBA00 = { name = "D3DDevice_SetRenderState_AlphaBlendEnable" }  # state table Render 15
+0x82CCBF48 = { name = "D3DDevice_SetRenderState_AlphaFunc" }  # state table Render 26
+0x82CCBED8 = { name = "D3DDevice_SetRenderState_AlphaRef" }  # state table Render 25
+0x82CCB930 = { name = "D3DDevice_SetRenderState_AlphaTestEnable" }  # state table Render 24
+0x82CCD520 = { name = "D3DDevice_SetRenderState_AlphaToMaskEnable" }  # state table Render 84
+0x82CCD558 = { name = "D3DDevice_SetRenderState_AlphaToMaskOffsets" }  # state table Render 85
+0x82CCBF80 = { name = "D3DDevice_SetRenderState_BlendFactor" }  # state table Render 17
+0x82CCBAB0 = { name = "D3DDevice_SetRenderState_BlendOp" }  # state table Render 20
+0x82CCBCA8 = { name = "D3DDevice_SetRenderState_BlendOpAlpha" }  # state table Render 23
+0x82CCC180 = { name = "D3DDevice_SetRenderState_Buffer2Frames" }  # state table Render 100
+0x82CCC438 = { name = "D3DDevice_SetRenderState_CCWStencilFail" }  # state table Render 36
+0x82CCC400 = { name = "D3DDevice_SetRenderState_CCWStencilFunc" }  # state table Render 39
+0x82CCC570 = { name = "D3DDevice_SetRenderState_CCWStencilMask" }  # state table Render 41
+0x82CCC4B8 = { name = "D3DDevice_SetRenderState_CCWStencilPass" }  # state table Render 38
+0x82CCC550 = { name = "D3DDevice_SetRenderState_CCWStencilRef" }  # state table Render 40
+0x82CCC590 = { name = "D3DDevice_SetRenderState_CCWStencilWriteMask" }  # state table Render 42
+0x82CCC478 = { name = "D3DDevice_SetRenderState_CCWStencilZFail" }  # state table Render 37
+0x82CCC5B0 = { name = "D3DDevice_SetRenderState_ClipPlaneEnable" }  # state table Render 43
+0x82CCC840 = { name = "D3DDevice_SetRenderState_ColorWriteEnable" }  # state table Render 53
+0x82CCC890 = { name = "D3DDevice_SetRenderState_ColorWriteEnable1" }  # state table Render 54
+0x82CCC8E0 = { name = "D3DDevice_SetRenderState_ColorWriteEnable2" }  # state table Render 55
+0x82CCC930 = { name = "D3DDevice_SetRenderState_ColorWriteEnable3" }  # state table Render 56
+0x82CCB8C0 = { name = "D3DDevice_SetRenderState_CullMode" }  # state table Render 14
+0x82CCC710 = { name = "D3DDevice_SetRenderState_DepthBias" }  # state table Render 52
+0x82CCBC00 = { name = "D3DDevice_SetRenderState_DestBlend" }  # state table Render 19
+0x82CCBDA8 = { name = "D3DDevice_SetRenderState_DestBlendAlpha" }  # state table Render 22
+0x82CCD5F8 = { name = "D3DDevice_SetRenderState_DiscardBand_X" }  # state table Render 88
+0x82CCD628 = { name = "D3DDevice_SetRenderState_DiscardBand_Y" }  # state table Render 89
+0x82CCB8F8 = { name = "D3DDevice_SetRenderState_FillMode" }  # state table Render 13
+0x82CCD588 = { name = "D3DDevice_SetRenderState_GuardBand_X" }  # state table Render 86
+0x82CCD5C0 = { name = "D3DDevice_SetRenderState_GuardBand_Y" }  # state table Render 87
+0x82CCD478 = { name = "D3DDevice_SetRenderState_HalfPixelOffset" }  # state table Render 81
+0x82CCD710 = { name = "D3DDevice_SetRenderState_HiStencilEnable" }  # state table Render 90
+0x82CCD780 = { name = "D3DDevice_SetRenderState_HiStencilFunc" }  # state table Render 92
+0x82CCD7B8 = { name = "D3DDevice_SetRenderState_HiStencilRef" }  # state table Render 93
+0x82CCD748 = { name = "D3DDevice_SetRenderState_HiStencilWriteEnable" }  # state table Render 91
+0x82CCD660 = { name = "D3DDevice_SetRenderState_HiZEnable" }  # state table Render 96
+0x82CCD698 = { name = "D3DDevice_SetRenderState_HiZWriteEnable" }  # state table Render 97
+0x82CCD0C8 = { name = "D3DDevice_SetRenderState_HighPrecisionBlendEnable" }  # state table Render 77
+0x82CCD180 = { name = "D3DDevice_SetRenderState_HighPrecisionBlendEnable1" }  # state table Render 78
+0x82CCD238 = { name = "D3DDevice_SetRenderState_HighPrecisionBlendEnable2" }  # state table Render 79
+0x82CCD2F0 = { name = "D3DDevice_SetRenderState_HighPrecisionBlendEnable3" }  # state table Render 80
+0x82CCC0B8 = { name = "D3DDevice_SetRenderState_LastPixel" }  # state table Render 98
+0x82CCC0F8 = { name = "D3DDevice_SetRenderState_LineWidth" }  # state table Render 99
+0x82CCD3F0 = { name = "D3DDevice_SetRenderState_MaxTessellationLevel" }  # state table Render 59
+0x82CCD3A8 = { name = "D3DDevice_SetRenderState_MinTessellationLevel" }  # state table Render 58
+0x82CCC7E0 = { name = "D3DDevice_SetRenderState_MultiSampleAntiAlias" }  # state table Render 48
+0x82CCC818 = { name = "D3DDevice_SetRenderState_MultiSampleMask" }  # state table Render 49
+0x82CCC990 = { name = "D3DDevice_SetRenderState_PointSize" }  # state table Render 44
+0x82CCCA68 = { name = "D3DDevice_SetRenderState_PointSizeMax" }  # state table Render 47
+0x82CCCA00 = { name = "D3DDevice_SetRenderState_PointSizeMin" }  # state table Render 45
+0x82CCC980 = { name = "D3DDevice_SetRenderState_PointSpriteEnable" }  # state table Render 46
+0x82CCD7E8 = { name = "D3DDevice_SetRenderState_PresentImmediateThreshold" }  # state table Render 95
+0x82CCD7D8 = { name = "D3DDevice_SetRenderState_PresentInterval" }  # state table Render 94
+0x82CCD4B8 = { name = "D3DDevice_SetRenderState_PrimitiveResetEnable" }  # state table Render 82
+0x82CCD4F0 = { name = "D3DDevice_SetRenderState_PrimitiveResetIndex" }  # state table Render 83
+0x82CCF340 = { name = "D3DDevice_SetRenderState_ScissorTestEnable" }  # state table Render 50
+0x82CCBE28 = { name = "D3DDevice_SetRenderState_SeparateAlphaBlendEnable" }  # state table Render 16
+0x82CCC620 = { name = "D3DDevice_SetRenderState_SlopeScaleDepthBias" }  # state table Render 51
+0x82CCBB58 = { name = "D3DDevice_SetRenderState_SrcBlend" }  # state table Render 18
+0x82CCBD28 = { name = "D3DDevice_SetRenderState_SrcBlendAlpha" }  # state table Render 21
+0x82CCC280 = { name = "D3DDevice_SetRenderState_StencilEnable" }  # state table Render 27
+0x82CCC348 = { name = "D3DDevice_SetRenderState_StencilFail" }  # state table Render 29
+0x82CCC310 = { name = "D3DDevice_SetRenderState_StencilFunc" }  # state table Render 32
+0x82CCC510 = { name = "D3DDevice_SetRenderState_StencilMask" }  # state table Render 34
+0x82CCC3C8 = { name = "D3DDevice_SetRenderState_StencilPass" }  # state table Render 31
+0x82CCC4F0 = { name = "D3DDevice_SetRenderState_StencilRef" }  # state table Render 33
+0x82CCC530 = { name = "D3DDevice_SetRenderState_StencilWriteMask" }  # state table Render 35
+0x82CCC388 = { name = "D3DDevice_SetRenderState_StencilZFail" }  # state table Render 30
+0x82CCD438 = { name = "D3DDevice_SetRenderState_TessellationMode" }  # state table Render 57
+0x82CCC2D0 = { name = "D3DDevice_SetRenderState_TwoSidedStencilMode" }  # state table Render 28
+0x82CCCF50 = { name = "D3DDevice_SetRenderState_ViewportEnable" }  # state table Render 76
+0x82CCCB70 = { name = "D3DDevice_SetRenderState_Wrap0" }  # state table Render 60
+0x82CCCB98 = { name = "D3DDevice_SetRenderState_Wrap1" }  # state table Render 61
+0x82CCCD38 = { name = "D3DDevice_SetRenderState_Wrap10" }  # state table Render 70
+0x82CCCD68 = { name = "D3DDevice_SetRenderState_Wrap11" }  # state table Render 71
+0x82CCCD98 = { name = "D3DDevice_SetRenderState_Wrap12" }  # state table Render 72
+0x82CCCDC8 = { name = "D3DDevice_SetRenderState_Wrap13" }  # state table Render 73
+0x82CCCDF8 = { name = "D3DDevice_SetRenderState_Wrap14" }  # state table Render 74
+0x82CCCE28 = { name = "D3DDevice_SetRenderState_Wrap15" }  # state table Render 75
+0x82CCCBC8 = { name = "D3DDevice_SetRenderState_Wrap2" }  # state table Render 62
+0x82CCCBF8 = { name = "D3DDevice_SetRenderState_Wrap3" }  # state table Render 63
+0x82CCCC28 = { name = "D3DDevice_SetRenderState_Wrap4" }  # state table Render 64
+0x82CCCC58 = { name = "D3DDevice_SetRenderState_Wrap5" }  # state table Render 65
+0x82CCCC88 = { name = "D3DDevice_SetRenderState_Wrap6" }  # state table Render 66
+0x82CCCCB8 = { name = "D3DDevice_SetRenderState_Wrap7" }  # state table Render 67
+0x82CCCCE0 = { name = "D3DDevice_SetRenderState_Wrap8" }  # state table Render 68
+0x82CCCD08 = { name = "D3DDevice_SetRenderState_Wrap9" }  # state table Render 69
+0x82CCC1B8 = { name = "D3DDevice_SetRenderState_ZEnable" }  # state table Render 10
+0x82CCC240 = { name = "D3DDevice_SetRenderState_ZFunc" }  # state table Render 11
+0x82CCC208 = { name = "D3DDevice_SetRenderState_ZWriteEnable" }  # state table Render 12
+0x82CCF4C8 = { name = "D3DDevice_SetRenderTarget" }  # confirmed
+0x82CDFE60 = { name = "D3DDevice_SetRingBufferParameters" }  # confirmed
+0x82CCE100 = { name = "D3DDevice_SetSamplerState_AddressU" }  # state table Sampler 0
+0x82CCE160 = { name = "D3DDevice_SetSamplerState_AddressV" }  # state table Sampler 1
+0x82CCE1C0 = { name = "D3DDevice_SetSamplerState_AddressW" }  # state table Sampler 2
+0x82CCDDC0 = { name = "D3DDevice_SetSamplerState_AnisotropyBias" }  # state table Sampler 15
+0x82CCE078 = { name = "D3DDevice_SetSamplerState_BorderColor" }  # state table Sampler 3
+0x82CCE280 = { name = "D3DDevice_SetSamplerState_HGradientExpBias" }  # state table Sampler 16
+0x82CCDA10 = { name = "D3DDevice_SetSamplerState_MagFilter" }  # state table Sampler 4
+0x82CCDB40 = { name = "D3DDevice_SetSamplerState_MagFilterZ" }  # state table Sampler 10
+0x82CCDD30 = { name = "D3DDevice_SetSamplerState_MaxAnisotropy" }  # state table Sampler 9
+0x82CCDF48 = { name = "D3DDevice_SetSamplerState_MaxMipLevel" }  # state table Sampler 8
+0x82CCD810 = { name = "D3DDevice_SetSamplerState_MinFilter" }  # state table Sampler 5
+0x82CCD940 = { name = "D3DDevice_SetSamplerState_MinFilterZ" }  # state table Sampler 11
+0x82CCDFE0 = { name = "D3DDevice_SetSamplerState_MinMipLevel" }  # state table Sampler 13
+0x82CCDC00 = { name = "D3DDevice_SetSamplerState_MipFilter" }  # state table Sampler 6
+0x82CCDE88 = { name = "D3DDevice_SetSamplerState_MipMapLodBias" }  # state table Sampler 7
+0x82CCE3A8 = { name = "D3DDevice_SetSamplerState_PointBorderEnable" }  # state table Sampler 19
+0x82CCDC60 = { name = "D3DDevice_SetSamplerState_SeparateZFilterEnable" }  # state table Sampler 12
+0x82CCE220 = { name = "D3DDevice_SetSamplerState_TrilinearThreshold" }  # state table Sampler 14
+0x82CCE2E8 = { name = "D3DDevice_SetSamplerState_VGradientExpBias" }  # state table Sampler 17
+0x82CCE348 = { name = "D3DDevice_SetSamplerState_WhiteBorderColorW" }  # state table Sampler 18
+0x82CCE420 = { name = "D3DDevice_SetScissorRect" }  # confirmed
+0x82CF25B8 = { name = "D3DDevice_SetScreenExtentQueryMode" }  # confirmed
+0x82CC3430 = { name = "D3DDevice_SetShaderGPRAllocation" }  # confirmed
+0x82CCE5F8 = { name = "D3DDevice_SetStreamSource" }  # shape match, checked
+0x82CD7DE0 = { name = "D3DDevice_SetTexture" }  # shape match, checked
+0x82CC2DC0 = { name = "D3DDevice_SetVertexDeclaration" }  # shape match, checked
+0x82CCED90 = { name = "D3DDevice_SetVertexFetchConstant" }  # confirmed
+0x82CC2B38 = { name = "D3DDevice_SetVertexShader" }  # shape match, checked
+0x82CC24C0 = { name = "D3DDevice_SetVertexShaderConstantB" }  # confirmed
+0x82CC2640 = { name = "D3DDevice_SetVertexShaderConstantI" }  # confirmed
+0x82CCF350 = { name = "D3DDevice_SetViewport" }  # call graph via D3D_SetSurfaceInfo
+0x82CD9AE8 = { name = "D3DDevice_Swap" }  # confirmed
+0x82CD3E78 = { name = "D3DDevice_UnsetAll" }  # shape match, checked
+0x82CE5860 = { name = "D3DIndexBuffer_Lock" }  # confirmed
+0x82CD7500 = { name = "D3DLineTexture_LockRect" }  # shape match, checked
+0x82CE3C80 = { name = "D3DResource_AddRef" }  # confirmed
+0x82CE4C08 = { name = "D3DResource_Destroy" }  # confirmed
+0x82CE35A8 = { name = "D3DResource_GetType" }  # confirmed
+0x82CE4F38 = { name = "D3DResource_Release" }  # confirmed
+0x82CD7C50 = { name = "D3DSurface_GetDesc" }  # shape match, checked
+0x82CD7D08 = { name = "D3DSurface_LockRect" }  # confirmed
+0x82CD4BC8 = { name = "D3DSurface_UnlockRect" }  # shape match, checked
+0x82CD7420 = { name = "D3DTexture_GetSurfaceLevel" }  # shape match, checked
+0x82CE57A0 = { name = "D3DVertexBuffer_Lock" }  # confirmed
+0x82CE3F58 = { name = "D3DVertexBuffer_Unlock" }  # shape match, checked
+0x82CE3340 = { name = "D3DVertexShader_Bind" }  # confirmed
+0x82CD7770 = { name = "D3DVolumeTexture_GetVolumeLevel" }  # shape match, checked
+0x82CD7D60 = { name = "D3DVolume_GetDesc" }  # shape match, checked
+0x82CD7DB8 = { name = "D3DVolume_LockBox" }  # shape match, checked
+0x82CD5058 = { name = "D3D_AlignTextureDimensions" }  # call graph via D3D_FindTextureSize
+0x82CD4DE0 = { name = "D3D_BlockSizeOfGpuFormat" }  # call graph via D3D_LockSurface
+0x82CD3668 = { name = "D3D_CBlocker_Check" }  # confirmed
+0x82CDDF30 = { name = "D3D_CDevice_AllocateInlineData" }  # confirmed
+0x82CDF930 = { name = "D3D_CDevice_BeginRingBig" }  # shape match, checked
+0x82CDDAD8 = { name = "D3D_CDevice_BlockOnFence" }  # confirmed
+0x82CDF610 = { name = "D3D_CDevice_KickOff" }  # confirmed
+0x82CDF1D0 = { name = "D3D_CDevice_KickOffSegment" }  # confirmed
+0x82CC1ED8 = { name = "D3D_CleanupGprAllocationSetup" }  # call graph via D3DDevice_SetShaderGPRAllocation
+0x82CD51B8 = { name = "D3D_FindTextureSize" }  # call graph via D3D_SetTextureHeader
+0x82CD5E08 = { name = "D3D_Get2DSurfaceDesc" }  # shape match, checked
+0x82CD5F40 = { name = "D3D_Get3DSurfaceDesc" }  # shape match, checked
+0x82CD4A18 = { name = "D3D_GetGpuTextureDimensions" }  # shape match, checked
+0x82CD5970 = { name = "D3D_GetLevelLayout" }  # shape match, checked
+0x82CD4F58 = { name = "D3D_GetMaxMipLevels" }  # call graph via D3D_SetTextureHeader
+0x82CD5788 = { name = "D3D_GetMipTailLevelOffsetCoords" }  # shape match, checked
+0x82CD6078 = { name = "D3D_GetSubresourceLayout" }  # call graph via D3D_LockSurface
+0x82CD4960 = { name = "D3D_GetTextureDimensions" }  # shape match, checked
+0x82CF75F0 = { name = "D3D_InitializeApiState" }  # confirmed
+0x82CF81C0 = { name = "D3D_InitializePresentationParameters" }  # confirmed
+0x82CD3DC0 = { name = "D3D_InvalidateConstants" }  # shape match, checked
+0x82CD6758 = { name = "D3D_Lock2DSurface" }  # confirmed
+0x82CD6808 = { name = "D3D_Lock3DSurface" }  # shape match, checked
+0x82CE5380 = { name = "D3D_LockResource" }  # confirmed
+0x82CD6658 = { name = "D3D_LockSurface" }  # call graph via D3D_Lock2DSurface
+0x82CCEF48 = { name = "D3D_ResetAllState" }  # call graph via D3DDevice_EndTiling
+0x82CDD690 = { name = "D3D_RingBufferDeviceAllocate" }  # shape match, checked
+0x82CCB540 = { name = "D3D_SetSurfaceClip" }  # confirmed
+0x82CCF418 = { name = "D3D_SetSurfaceInfo" }  # call graph via D3DDevice_SetRenderTarget
+0x82CD68D8 = { name = "D3D_SetTextureHeader" }  # call graph via D3DDevice_CreateTexture
+0x82CCF070 = { name = "D3D_SetViewport" }  # call graph via D3DDevice_SetViewport
+0x82CD9540 = { name = "D3D_SynchronizeToPresentationInterval" }  # confirmed
+0x82CE3920 = { name = "D3D_UnlockResource" }  # confirmed
+0x82D09ED8 = { name = "D3D_XenonGpu_Initialize" }  # confirmed
+0x82CD4448 = { name = "Direct3D_CreateDevice" }  # confirmed
+0x82CC2880 = { name = "XGRegisterPixelShader" }  # confirmed
+0x82CC63B8 = { name = "XGRegisterVertexShader" }  # confirmed

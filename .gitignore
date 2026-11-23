@@ -1,0 +1,48 @@
+# Your own game files and everything made from them: never committed.
+/assets/
+/app/generated/
+# Made by tools/thunk_table.py from the game's image (addresses of the game's code).
+/app/thunks.toml
+*.xex
+*.iso
+
+# Build output
+/out/
+/sdk/out/
+/app/out/
+
+# Local logs and dumps
+*.log
+*.dmp
+*.bin
+__pycache__/
+
+# 2026-11-23 (the public 1.0.0 upload; blur-nx's rules): built and game-derived files outside out/ and app/out/.
+# The NRO holds the recompiled game code; shader libraries, pipeline caches and lists, DKSH caches, shader microcode
+# dumps, screenshots and the game file index are made from the game's data.
+*.nro
+*.nso
+*.nacp
+*.elf
+*.mesp
+*.mesp.idx
+*.dksh
+*.ucode
+*.rgba
+*.mp4
+*.zip
+*.jpg
+*.png
+*.stackdump
+deko3d_shaders*.bin
+pipeline_list*.bin
+vfs_index*.bin
+/newlogs and shadowdump/
+logs/
+# The PGO profiles: only the released NRO's (pgo-inplace/*.gcda: counts of which code ran, no game code or data)
+/pgo/
+/pgo-onemode/
+/pgo_*/
+/pgo-inplace/*
+!/pgo-inplace/*.gcda
+*.stream

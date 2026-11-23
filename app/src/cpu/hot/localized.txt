@@ -1,0 +1,34 @@
+# sasrt-nx (2026-11-08): guest functions replaced by localized copies (tools/localize_native.py, katamari-nx's; its
+# guard in app/src/cpu/banjo_hot_guest.cpp), regenerated into app/generated/hot/ by tools/post_codegen.py after every
+# codegen. One per line: <address> [off] [key=...] <what>. Each has its own key, sasrt_cpu_native_sub_<address>.
+# The bulk list (every other function the console profile sampled) is localized_bulk.txt (tools/switch_hot_bulk.py).
+#
+# The 2026-10-06 / 10-07 copies of app/src/hot/localized.txt (sa2-nx's localizer, ranked on PC profiles; that file
+# says how each was measured). katamari-nx's localizer synchronises only the registers a callee can reach, which is
+# what the old one lacked for the copies that call other functions.
+827C56C8 hot game function, only the register save/restore helpers as calls (1.1 %; PC A/B 1,894 -> 1,625 samples)
+82757940 hot game function, leaf (0.3 %; 482 -> 236)
+82611908 hot game function, leaf (0.2 %; 413 -> 252)
+827168E0 hot game function, leaf (0.4 %; 810 -> 616)
+82748550 hot game function, leaf (0.4 %; 548 -> 532)
+8279A888 hot game function, leaf (0.2 %; 349 -> 290)
+826116F0 hot game function, leaf (0.2 %; 314 -> 338)
+827C5DE8 hot game function, leaf (0.2 %; 256 -> 161)
+82C81418 hot game function, leaf (0.2 %; 345 -> 315)
+82C99110 hot game function, leaf (124 -> 115)
+82C80698 hot game function, leaf (99 -> 31)
+82934670 hot game function, leaf (173 -> 113)
+82C98FB0 hot game function, leaf (75 -> 72)
+82610250 hot game function, leaf (187 -> 100)
+82EB23E0 hot VMX function of the SlRenderer thread, leaf (3.3 % of its PC samples)
+830260A0 hot VMX function of the SlRenderer thread, leaf (1.5 %)
+83027D38 hot VMX function, leaf (0.2 % of all samples)
+830291B8 hot VMX function, leaf (0.2 % of all samples)
+82D7B288 hot VMX function of a worker thread (XThread2914), leaf (1.0 % of its samples)
+#
+# 2026-11-08: the functions of hand.txt, so each has a hook of its own (the native first, the copy when it declines),
+# as katamari-nx lists its hand-written natives here too.
+82C92CC8 stack cookie check (hand-written native: the equal path)
+82872180 water table lookup (hand-written native; 1.9 % of the stock-clock console profile)
+82720840 audio resampler (hand-written native; 0.8 % of the stock-clock console profile)
+8286C230 water simulation step (hand-written native; the hottest function of the stock-clock console profile)

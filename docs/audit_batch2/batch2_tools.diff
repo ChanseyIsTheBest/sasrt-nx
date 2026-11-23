@@ -1,0 +1,321 @@
+--- a/tools/localize_native.py
++++ b/tools/localize_native.py
+@@ -176,12 +176,94 @@
+ ATOMIC_TIME = re.compile(r'^\t+[\w.]+\.u64 = REX_QUERY_TIMEBASE\(\);$')
+ 
+ 
++# sasrt-nx (2026-11-11, machine-copy idea 39): store-card runs. Every guest store outside the stack marks its page's card
++# (tools/store_cards.py, after this tool). In the copies (app/src/cpu/banjo_hot_prelude.h with SASRT_HOT_CARD_RUNS) a
++# function keeps the page of its current run of stores in a local (REX_CARD_RUN_DECL) and marks a page when the run moves
++# to another one, and the pending page at every point another thread can be told about the stores: before every call
++# (a copy's callee included), atomic, fence and return, and at the function's end (REX_CARD_FLUSH). So every store's
++# page is still marked before the function's next synchronisation, which is what Renut's cached copies need (they are
++# checked at a kick, which the game reaches through a call). Without SASRT_HOT_CARD_RUNS both macros are nothing.
++# SASRT_LOCALIZE_CARD_RUNS=0: not written.
++CARD_RUNS = os.environ.get('SASRT_LOCALIZE_CARD_RUNS', '1') != '0'
++# sasrt-nx (2026-11-11, machine-copy idea 52): in a loop, a register loaded from itself (`r7 = *(r7 + K)`: a linked list's
++# next pointer) is followed by a prefetch of the node it now points at (REX_PREFETCH_GUEST, banjo_hot_common.h: a hint
++# that cannot fault; SASRT_HOT_PREFETCH=OFF in CMake compiles it out), so the node's line is on its way during the rest
++# of the iteration. SASRT_LOCALIZE_PREFETCH=0: not written.
++PREFETCH = os.environ.get('SASRT_LOCALIZE_PREFETCH', '1') != '0'
++CHASE_SRC = re.compile(r'^\t((?:ctx\.)?r\d+)\.u64 = REX_LOAD_D_U32\(\1\.u32, -?\d+\);$')
++CHASE = re.compile(r'^\t(l{1,2}_r\d+|r\d+)\.u64 = REX_LOAD_D_U32\(\1\.u32, -?\d+\);$')
++# sasrt-nx (2026-11-11, machine-copy idea 60): tools/loop_barriers.py puts a compiler barrier at a loop header so a polling
++# loop's guest load is not hoisted out of it (a thread spinning forever); the barrier also keeps every invariant guest
++# load in the loop. A straight counted loop cannot spin on memory: its only way back is the count register's `bdnz`,
++# nothing in it writes the count register, and it has no other branch, return or call. Its exit does not depend on a
++# load, so a hoisted load only means another thread's write is seen after the (bounded) loop instead of during it.
++# The copies' running form leaves those barriers out (the original statements' form keeps them); the compiler's own
++# alias analysis then hoists what it can prove (same base, other offsets). SASRT_LOCALIZE_COUNTED_BARRIERS=1: kept.
++COUNTED_NO_BARRIER = os.environ.get('SASRT_LOCALIZE_COUNTED_BARRIERS', '0') != '1'
++LOOP_LABEL = re.compile(r'^(loc_[0-9A-F]+):\s*$')
++CTR_DEC = re.compile(r'^\t--(?:ctx\.)?ctr\.u64;$')
++CTR_BACK = re.compile(r'^\tif \((?:ctx\.)?ctr\.u32 != 0\) goto (loc_[0-9A-F]+);$')
++CTR_WRITE = re.compile(r'\b(?:ctx\.)?ctr\.(?:u|s)(?:32|64) = ')
++LOOP_STATS = [0, 0]  # idea 52 prefetches, idea 60 barriers left out
++CONST_ARGS = os.environ.get('SASRT_LOCALIZE_CONST_ARGS', '1') != '0'  # machine-copy idea 34 (localize())
++CONST_ARG_FORCED = [0]
++
++
++def loop_info(lines):
++    """(indices of loop-carried pointer loads, indices of the barrier lines of straight counted loops) of one function's lines."""
++    labels = {}
++    for i, l in enumerate(lines):
++        m = LOOP_LABEL.match(l)
++        if m:
++            labels.setdefault(m.group(1), i)
++    inside, drop, chase = set(), set(), set()
++    backs = {}
++    for j, l in enumerate(lines):
++        for lab in re.findall(r'goto (loc_[0-9A-F]+);', l):
++            if lab in labels and labels[lab] < j:
++                backs.setdefault(lab, []).append(j)
++    for lab, js in backs.items():
++        i, end = labels[lab], max(js)
++        inside.update(range(i, end + 1))
++        # Idea 52: a pointer the loop carries (`p = p->next`): its only definitions in the loop are its own loads.
++        for k in range(i, end + 1):
++            mc = CHASE_SRC.match(lines[k])
++            if not mc:
++                continue
++            reg = mc.group(1)
++            defs = [q for q in range(i, end + 1) if re.match(r'^\t' + re.escape(reg) + r'\.[us](?:8|16|32|64) = ', lines[q])]
++            if all(CHASE_SRC.match(lines[q]) and CHASE_SRC.match(lines[q]).group(1) == reg for q in defs):
++                chase.add(k)
++        if not COUNTED_NO_BARRIER:
++            continue
++        bar = next((k for k in range(i + 1, min(i + 3, len(lines))) if lines[k].strip() == 'REX_LOOP_BARRIER();'), None)
++        if bar is None:
++            continue
++        ok = all(CTR_BACK.match(lines[j]) and j > 0 and CTR_DEC.match(lines[j - 1]) for j in js)
++        for k in range(i + 1, end + 1):
++            if not ok:
++                break
++            l = lines[k]
++            if CTR_BACK.match(l) and CTR_BACK.match(l).group(1) == lab:
++                continue
++            if CTR_DEC.match(l):
++                continue
++            if ('goto ' in l or re.search(r'\breturn\b', l) or CALL.search(l) or 'switch (' in l or CTR_WRITE.search(l)
++                    or LOOP_LABEL.match(l) and LOOP_LABEL.match(l).group(1) != lab and False):
++                ok = False
++        if ok:
++            drop.add(bar)
++    return chase, drop
++CARD_FLUSH = 'REX_CARD_FLUSH(); ' if CARD_RUNS else ''
++
++
+ def atomic_stop(l):
+     """A reservation load, compare-and-swap or fence, with the guard's stop in front (see ATOMICS)."""
+     if not ATOMICS or not (ATOMIC_LOAD.match(l) or ATOMIC_CAS.match(l) or ATOMIC_FENCE.match(l) or ATOMIC_TIME.match(l)):
+         return l
+     stripped = l.lstrip('\t')
+-    return l[:len(l) - len(stripped)] + '{ if (s.Open()) return; ' + stripped + ' }'
++    flush = CARD_FLUSH if (ATOMIC_CAS.match(l) or ATOMIC_FENCE.match(l)) else ''  # idea 39
++    return l[:len(l) - len(stripped)] + '{ if (s.Open()) return; ' + flush + stripped + ' }'
+ 
+ 
+ ALL = None  # "reach unknown": every register
+@@ -1010,9 +1092,9 @@
+                 # registers their originals write back (hand.txt exact=: the hash and the comparison return r3), and
+                 # a caller that read r3 after an inlined native that ran got its own stale r3 (sub_82737F80 and
+                 # sub_8271F9C0 took the other branch; the first diet PC run crashed after them).
+-                return ('{ ' + before + 'if (!::banjo::hand::n_%s::Native(ctx, base, s)) { f_%s(ctx, base, s); '
++                return ('{ ' + before + CARD_FLUSH + 'if (!::banjo::hand::n_%s::Native(ctx, base, s)) { f_%s(ctx, base, s); '
+                         'if (s.Stopped()) return; } else if (s.Stopped()) return;%s }' % (hand[b]['id'], b, after))
+-            return '{ ' + before + 'f_%s(ctx, base, s); if (s.Stopped()) return;' % b + after + ' }'
++            return '{ ' + before + CARD_FLUSH + 'f_%s(ctx, base, s); if (s.Stopped()) return;' % b + after + ' }'
+         stats['calls_open'] += 1
+         if open_native:
+             # The native path: the registers it reads stored first, those it writes loaded after. The declined path:
+@@ -1021,9 +1103,9 @@
+             post = ''.join(f' l_{r} = ctx.{r};' for r in my_regs if r in index.funcs[b]['written'])
+             before_all = ''.join(f'ctx.{r} = l_{r}; ' for r in my_written)
+             after_all = ''.join(f' l_{r} = ctx.{r};' for r in my_regs)
+-            return ('{ ' + pre + 'if (!::banjo::hand::n_%s::Native(ctx, base, s)) { if (s.Open()) return; ' % hand[b]['id']
++            return ('{ ' + pre + CARD_FLUSH + 'if (!::banjo::hand::n_%s::Native(ctx, base, s)) { if (s.Open()) return; ' % hand[b]['id']
+                     + before_all + m.group(0) + after_all + ' } else {' + post + ' if (s.Stopped()) return; } }')
+-        return '{ if (s.Open()) return; ' + before + m.group(0) + after + ' }'
++        return '{ if (s.Open()) return; ' + before + CARD_FLUSH + m.group(0) + after + ' }'
+ 
+     # Callee copies the compiler must inline into their callers: then a guest call inside the copy is no call at all,
+     # the registers handed over through the context are forwarded (the context is `restrict`: the store before the
+@@ -1057,6 +1139,28 @@
+     # The generated copy of a function with a hand-written native only runs when the native declines: out of line and
+     # cold (inlined, it took registers away from the hand-written path: every call then saved five pairs of them).
+     forced -= set(hand)
++    # sasrt-nx (2026-11-11, machine-copy idea 34): a constant argument reaches a callee only when the compiler inlines
++    # it (IPA-CP cannot follow the context: the batch NRO had 1 .constprop clone among the copies). The members forced
++    # inline above take 5,413 of the 9,412 calls between copies; of the others, those called with a literal in an
++    # argument register (set in the same block before the call, a register the callee reads) are forced inline too
++    # when at most 3 calls reach them: their inlined body is the constant-argument clone. SASRT_LOCALIZE_CONST_ARGS=0: off.
++    if CONST_ARGS:
++        literal = re.compile(r'^\t(?:ctx\.)?(r\d+)\.s64 = -?\d+;$')
++        for name in members:
++            ls = [l for _, l in index.body(name)]
++            for i, l in enumerate(ls):
++                for m in re.finditer(r'\b(?:__imp__)?(sub_[0-9A-F]{8})\(ctx, base\);', l):
++                    b = m.group(1)
++                    if b not in members[1:] or b in forced or b in hand or reaches_itself(b) or calls_to[b] > 3:
++                        continue
++                    for k in range(i - 1, max(-1, i - 9), -1):
++                        if LOOP_LABEL.match(ls[k]):
++                            break
++                        mc = literal.match(ls[k])
++                        if mc and mc.group(1) in funcs[b]['regs']:
++                            forced.add(b)
++                            CONST_ARG_FORCED[0] += 1
++                            break
+ 
+     declarations = []
+     dead_out = set()  # machine-copy idea 37: (member, register) write-backs LiveOut leaves out
+@@ -1079,6 +1183,7 @@
+         for m in PROMOTED.finditer(text):
+             externs.add(m.group(1))
+         dirty, writes, dirty_end = dirty_sets(name, lines, lambda l: [call_reach(m)[0] for m in CALL.finditer(l)])
++        in_loop, counted_barriers = loop_info(lines)  # machine-copy ideas 52 and 60
+         file_lines = original_lines.setdefault(funcs[name]['file'], {})
+         for localized in (True, False):
+             body = []  # (text, block)
+@@ -1124,16 +1229,24 @@
+                     if not in_switch and (GOTO.search(l) or RETURN.search(l)):
+                         pending = True
+                     l = REG.sub(lambda m: 'l_' + m.group(1), l)
++                if localized and at in counted_barriers:
++                    LOOP_STATS[1] += 1  # idea 60: a straight counted loop's barrier left out of the running form
++                    continue
+                 l, stores = store_line(l)
+                 l = atomic_stop(l)  # sasrt-nx (2026-11-10): see ATOMICS
+                 l = CALL.sub(lambda m: call_text(m, name, regs, here, localized), l)
+-                if localized and sync_ret:
++                if localized and (sync_ret or CARD_FLUSH):
+                     # Braces: the generated code also writes a return as the body of a one-line `if`.
+                     l = RETURN.sub(lambda m: m.group(0) if 'if (s.' in l[max(0, m.start() - 24):m.start()]
+-                                   else '{ ' + sync_ret + 'return; }', l)
++                                   else '{ ' + sync_ret + CARD_FLUSH + 'return; }', l)
+                 body.append((l, block))
+                 if stores:
+                     body.append(('\tif (s.Stopped()) return;', block))
++                if localized and PREFETCH and at in in_loop:
++                    mc = CHASE.match(l)
++                    if mc:
++                        body.append((f'\tREX_PREFETCH_GUEST({mc.group(1)}.u32);', block))  # idea 52
++                        LOOP_STATS[0] += 1
+             if localized:
+                 how = ('[[gnu::always_inline]] static inline' if name in forced
+                        else '[[gnu::noinline, gnu::cold]] static' if name in hand else 'static')
+@@ -1142,6 +1255,8 @@
+                 declarations.append(head + ';')
+                 block_of_line.append((head.split('\n')[0], None))
+                 block_of_line.append((head.split('\n')[1] + ' {', entry_block[name]))
++                if CARD_RUNS:
++                    block_of_line.append(('\tREX_CARD_RUN_DECL', entry_block[name]))  # idea 39
+                 for r in regs:
+                     block_of_line.append((f'\t{type_of(r)} l_{r} = ctx.{r};', entry_block[name]))
+                 block_of_line.extend(body)
+@@ -1150,6 +1265,8 @@
+                     end = [r for r in end if keep_out(r)]  # idea 37
+                 if end and not (numbered and ONLY_RETURN.match(numbered[-1][1])):
+                     block_of_line.append(('\t' + ' '.join(f'ctx.{r} = l_{r};' for r in end), block))
++                if CARD_RUNS and not (numbered and ONLY_RETURN.match(numbered[-1][1])):
++                    block_of_line.append(('\tREX_CARD_FLUSH();', block))  # idea 39: the function's end
+                 block_of_line.append(('}', block))
+                 block_of_line.append(('', None))
+             else:
+@@ -1157,6 +1274,8 @@
+                         f'[[maybe_unused]] ::banjo::hot::Logged& s)')
+                 declarations.append(head + ';')
+                 block_of_line.append((head + ' {', None))
++                if CARD_RUNS:
++                    block_of_line.append(('\tREX_CARD_RUN_DECL', None))  # idea 39 (the original's form marks as it goes)
+                 block_of_line.extend((l, None) for l, _ in body)
+                 block_of_line.append(('}', None))
+                 block_of_line.append(('', None))
+@@ -1391,6 +1510,9 @@
+                 skipped.append(f'{root} ({str(e).replace("localize_native: ", "")[:90]})')
+         write_list(entries, a.out, made)
+         print(f'localize_native: {LIVE_OUT_DROPPED[0]} return write-backs left out by LiveOut (idea 37)')
++        print(f'localize_native: {LOOP_STATS[0]} pointer-chase prefetches (idea 52), {LOOP_STATS[1]} counted loops\' '
++              f'barriers left out (idea 60)')
++        print(f'localize_native: {CONST_ARG_FORCED[0]} members with a constant argument forced inline (idea 34)')
+         print(f'localize_native: merged vector stores: {MERGED[0]} stvlx/stvrx pairs and {MERGED[1]} stvewx quads in '
+               f'{MERGED[2]} copies')
+         print(f'localize_native: {len(entries)} copies in {shown(a.out)}'
+--- a/tools/frozen_census.py
++++ b/tools/frozen_census.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""sasrt-nx (2026-11-11, machine-copy idea 46, part 1): the guest globals the localized copies load at a known address
++(a D-form load whose base register a `lis` / `addi` line set: the constants tools/ro_constants.py follows) that lie in
++the image's writable data. tools/ro_constants.py folds such loads when the data is read-only; these could be frozen
++(part 2: a copy with the value built in, behind an entry check) if the game writes them once. With --write this writes
++the census list app/generated/hot/frozen_census.inc ({address, size} per global), which the console's census
++(app/src/cpu/banjo_frozen_census.cpp, sasrt_cpu_frozen_census) samples during a race.
++
++  python tools/frozen_census.py [--write]      (post_codegen.py runs it with --write after the copies are made)
++"""
++import collections
++import glob
++import os
++import re
++import sys
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, os.path.join(ROOT, 'tools'))
++import ro_constants as rc  # noqa: E402
++
++SET = re.compile(r'^\t(l{0,2}_?r\d+)\.s64 = (-?\d+);$')
++ADD = re.compile(r'^\t(l{0,2}_?r\d+)\.s64 = (l{0,2}_?r\d+)\.s64 \+ (-?\d+);$')
++LOAD = re.compile(r'REX_LOAD_D_(U8|U16|U32|U64|F32|F64)\((l{0,2}_?r\d+)\.u32, (-?\d+)\)')
++DEF = re.compile(r'^\t(l{0,2}_?r\d+)\.')
++SIZE = {'U8': 1, 'U16': 2, 'U32': 4, 'U64': 8, 'F32': 4, 'F64': 8}
++
++
++def main():
++    image = open(os.path.join(ROOT, 'out', 'default_image.bin'), 'rb').read()
++    ranges, base = rc.read_only_ranges(image)
++    pch = open(os.path.join(ROOT, 'app', 'generated', 'default', 'sasrt_pch.h'), encoding='utf-8').read()
++    code_lo = int(re.search(r'#define REX_CODE_BASE (0x[0-9A-Fa-f]+)', pch).group(1), 16)
++    code_hi = code_lo + int(re.search(r'#define REX_CODE_SIZE (0x[0-9A-Fa-f]+)', pch).group(1), 16)
++    samples = {}
++    for line in open(os.path.join(ROOT, 'app', 'src', 'cpu', 'hot', 'localized_bulk.txt'), errors='replace'):
++        m = re.match(r'([0-9A-F]{8}) (\d+) console samples', line)
++        if m:
++            samples[m.group(1)] = int(m.group(2))
++    kind, per, addrs, sizes = collections.Counter(), collections.Counter(), collections.Counter(), {}
++    for path in glob.glob(os.path.join(ROOT, 'app', 'generated', 'hot', 'n_*.h')):
++        root = re.search(r'n_([0-9A-F]{8})', path).group(1)
++        lines = open(path, errors='replace').read().splitlines()
++        # The running forms only (the original statements' form o_* follows them).
++        cut = next((k for k, x in enumerate(lines) if x.startswith('static void o_') and x.rstrip().endswith('{')),
++                   len(lines))
++        known = {}
++        for line in lines[:cut]:
++            if not line.startswith('\t'):
++                known.clear()  # a label or a function's edge: a straight line ends
++                continue
++            m = SET.match(line)
++            if m:
++                known[m.group(1)] = int(m.group(2)) & 0xFFFFFFFF
++                continue
++            m = ADD.match(line)
++            if m and m.group(2) in known:
++                known[m.group(1)] = (known[m.group(2)] + int(m.group(3))) & 0xFFFFFFFF
++                continue
++            for t, r, off in LOAD.findall(line):
++                if r not in known:
++                    continue
++                a = (known[r] + int(off)) & 0xFFFFFFFF
++                inside = base <= a < base + len(image)
++                if inside and any(s <= a < e for s, e in ranges):
++                    kind['read-only'] += 1
++                elif code_lo <= a < code_hi:
++                    kind['code'] += 1
++                elif inside:
++                    kind['writable image data'] += 1
++                    per[root] += 1
++                    addrs[a] += 1
++                    sizes[a] = max(sizes.get(a, 0), SIZE[t])
++                else:
++                    kind['outside the image'] += 1
++            m = DEF.match(line)
++            if m:
++                known.pop(m.group(1), None)
++    print('frozen_census: known-address loads in the copies:', dict(kind))
++    print('frozen_census: writable data: %d loads in %d copies (%d console samples), %d globals' % (
++        sum(per.values()), len(per), sum(samples.get(r, 0) for r in per), len(addrs)))
++    if '--write' not in sys.argv:
++        return
++    out = os.path.join(ROOT, 'app', 'generated', 'hot', 'frozen_census.inc')
++    text = ('// GENERATED by tools/frozen_census.py (machine-copy idea 46): the writable guest globals the copies load at a\n'
++            '// known address, {address, size}; app/src/cpu/banjo_frozen_census.cpp samples them (sasrt_cpu_frozen_census).\n'
++            + ''.join('{0x%08Xu, %du},\n' % (a, sizes[a]) for a in sorted(addrs)))
++    old = open(out, encoding='utf-8').read() if os.path.exists(out) else None
++    if old != text:
++        with open(out, 'w', encoding='utf-8', newline='\n') as f:
++            f.write(text)
++    print('frozen_census: %d globals in %s%s' % (len(addrs), out, ' (unchanged)' if old == text else ''))
++
++
++if __name__ == '__main__':
++    main()

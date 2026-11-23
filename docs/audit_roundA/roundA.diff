@@ -1,0 +1,353 @@
+--- a/app/CMakeLists.txt
++++ b/app/CMakeLists.txt
+@@ -295,13 +295,35 @@
+ endif()
+ # sasrt-nx (2026-11-10, machine-copy idea 58): tools/localize_native.py puts the bulk copies with fewer than 3 console
+ # samples in shards 6-11; with this option those shards are compiled for size (-Os), the hot ones as before.
+-option(SASRT_HOT_COLD_SHARDS "Localized copies: the cold bulk shards (6-11) compiled for size" ON)
++# sasrt-nx (2026-11-11, the batch's run bt1): OFF. With -Os GCC kept the small helpers out of line in the cold shards
++# (23,987 calls from 699 of their 731 copies: CRRegister::compare, the flush-mode switches, the conversions), which
++# showed on the game thread (the compares 0.011 a frame there alone), and -Os overrides the profile: with PGO the
++# compiler already optimises for size the blocks and functions the profile finds cold.
++option(SASRT_HOT_COLD_SHARDS "Localized copies: the cold bulk shards (6-11) compiled for size" OFF)
++# sasrt-nx (2026-11-11): the SDK's small helpers forced inline (sdk/include/rex/ppc/diet_ops.h, REX_SMALL_HELPER).
++option(SASRT_FORCE_INLINE_HELPERS "The SDK's one-instruction helpers forced inline (OFF: REX_NO_FORCED_HELPERS)" ON)
++if(NOT SASRT_FORCE_INLINE_HELPERS)
++    add_compile_definitions(REX_NO_FORCED_HELPERS)
++endif()
++# sasrt-nx (2026-11-11, machine-copy idea 47): the link register's dead moves in the localized copies only. Every non-leaf
++# guest function reads ctx.lr (mflr), saves it at -8(r1), loads it back and writes ctx.lr (mtlr): with C++ returns the
++# value is never used (tools/frame_traffic.py marks only functions where the link register is not data). The shards are
++# compiled with REX_LR_MOVES_ELIDE (frame_traffic.py's opt-in switch: REX_LR_READ gives 0, the save and REX_LR_WRITE are
++# nothing); the generated tree keeps them. What it changes for the guest: the dead word at -8 of a copy's frame keeps its
++# old content (sa2-nx: the link-register half of the three elisions passed its frame-exact capture; the non-volatile
++# saves, which did not, stay). The guard compares only what its logged forms wrote, and both forms of a copy elide.
++option(SASRT_HOT_LR_ELIDE "Localized copies: the link register's dead moves left out (REX_LR_MOVES_ELIDE in the shards)" ON)
+ if(SASRT_HOT_COLD_SHARDS)
+     set_source_files_properties(
+         src/cpu/banjo_hot_shard_6.cpp src/cpu/banjo_hot_shard_7.cpp src/cpu/banjo_hot_shard_8.cpp
+         src/cpu/banjo_hot_shard_9.cpp src/cpu/banjo_hot_shard_10.cpp src/cpu/banjo_hot_shard_11.cpp
+         PROPERTIES COMPILE_OPTIONS "-Os")
+ endif()
++if(SASRT_HOT_LR_ELIDE)
++    foreach(_shard RANGE 0 11)
++        set_property(SOURCE src/cpu/banjo_hot_shard_${_shard}.cpp APPEND PROPERTY COMPILE_DEFINITIONS REX_LR_MOVES_ELIDE)
++    endforeach()
++endif()
+ if(NOT SASRT_HOT_MERGED_STORES)
+     target_compile_definitions(sasrt PRIVATE SASRT_HOT_MERGED_STORES_OFF)
+ endif()
+--- a/sdk/include/rex/ppc/context.h
++++ b/sdk/include/rex/ppc/context.h
+@@ -84,9 +84,9 @@
+     uint8_t un;
+   };
+ 
+-  inline uint32_t raw() const noexcept { return (lt << 3) | (gt << 2) | (eq << 1) | so; }
++  REX_SMALL_HELPER uint32_t raw() const noexcept { return (lt << 3) | (gt << 2) | (eq << 1) | so; }
+ 
+-  inline void set_raw(uint32_t value) noexcept {
++  REX_SMALL_HELPER void set_raw(uint32_t value) noexcept {
+     lt = (value >> 3) & 1;
+     gt = (value >> 2) & 1;
+     eq = (value >> 1) & 1;
+@@ -94,14 +94,14 @@
+   }
+ 
+   template <typename T>
+-  inline void compare(T left, T right, const XERRegister& xer) noexcept {
++  REX_SMALL_HELPER void compare(T left, T right, const XERRegister& xer) noexcept {  // (diet_ops.h: forced inline)
+     lt = left < right;
+     gt = left > right;
+     eq = left == right;
+     so = xer.so;
+   }
+ 
+-  inline void compare(double left, double right) noexcept {
++  REX_SMALL_HELPER void compare(double left, double right) noexcept {
+ #ifndef REX_NO_FAST_FCMP
+     // Mass Effect diet: same truth table, but the quiet comparison builtins let one fcmp serve all four
+     // flags (the relational operators and == compiled to fcmpe and fcmp pairs plus NaN tests).
+@@ -197,21 +197,21 @@
+     setcsr(csr);
+   }
+ 
+-  inline void enableFlushModeUnconditional() noexcept {
++  REX_SMALL_HELPER void enableFlushModeUnconditional() noexcept {
+     REX_SYS_CENSUS_SITE(rex::syscount::kCensusFlushWrite);
+     if ((csr & FlushMask) == FlushMask) REX_SYS_CENSUS(rex::syscount::kCensusFlushSame, 1);
+     csr |= FlushMask;
+     setcsr(csr);
+   }
+ 
+-  inline void disableFlushModeUnconditional() noexcept {
++  REX_SMALL_HELPER void disableFlushModeUnconditional() noexcept {
+     REX_SYS_CENSUS_SITE(rex::syscount::kCensusFlushWrite);
+     if ((csr & FlushMask) == 0) REX_SYS_CENSUS(rex::syscount::kCensusFlushSame, 1);
+     csr &= ~FlushMask;
+     setcsr(csr);
+   }
+ 
+-  inline void enableFlushMode() noexcept {
++  REX_SMALL_HELPER void enableFlushMode() noexcept {
+     if ((csr & FlushMask) != FlushMask) [[unlikely]] {
+       REX_SYS_CENSUS_SITE(rex::syscount::kCensusFlushWrite);
+       csr |= FlushMask;
+@@ -219,7 +219,7 @@
+     }
+   }
+ 
+-  inline void disableFlushMode() noexcept {
++  REX_SMALL_HELPER void disableFlushMode() noexcept {
+     if ((csr & FlushMask) != 0) [[unlikely]] {
+       REX_SYS_CENSUS_SITE(rex::syscount::kCensusFlushWrite);
+       csr &= ~FlushMask;
+@@ -228,8 +228,8 @@
+   }
+ 
+   // tools/flush_mode_flow.py: the test of a check the control flow proved redundant (PC builds keep it).
+-  inline bool flushModeIsOn() const noexcept { return (csr & FlushMask) == FlushMask; }
+-  inline bool flushModeIsOff() const noexcept { return (csr & FlushMask) == 0; }
++  REX_SMALL_HELPER bool flushModeIsOn() const noexcept { return (csr & FlushMask) == FlushMask; }
++  REX_SMALL_HELPER bool flushModeIsOff() const noexcept { return (csr & FlushMask) == 0; }
+ 
+   inline void InitHost() noexcept {
+     csr = getcsr();
+--- a/sdk/include/rex/ppc/diet_ops.h
++++ b/sdk/include/rex/ppc/diet_ops.h
+@@ -27,6 +27,19 @@
+ #define REX_DIET_CENSUS(k) ((void)0)
+ #endif
+ 
++// sasrt-nx (2026-11-11): the small helpers (one or a few host instructions) forced inline. Built with -Os, or inside a
++// big function past GCC's growth limits, the compiler kept them out of line: in the 2026-11-10 batch's NRO the
++// localized copies called them about 33,000 times (CRRegister::compare 21,000, the flush-mode switches 3,800,
++// SingleToDoublePure, QuietSingleBits, fctid, divw), and an out-of-line compare writes the copy's condition-register
++// local through memory. The generated tree already inlined every call (0 out of line). The any-mode and slow helpers
++// stay as they are (out of line in the generated tree too). REX_NO_FORCED_HELPERS (CMake
++// SASRT_FORCE_INLINE_HELPERS=OFF) gives plain `inline` again.
++#ifndef REX_NO_FORCED_HELPERS
++#define REX_SMALL_HELPER [[gnu::always_inline]] inline
++#else
++#define REX_SMALL_HELPER inline
++#endif
++
+ namespace rex::ppc {
+ 
+ /// fctiwz: truncate toward zero to int32 with PPC saturation, NaN -> 0x80000000. Returned as the s64 register image
+@@ -34,7 +47,7 @@
+ /// The old expression was `isnan ? 0x80000000U : v >= INT_MAX ? INT_MAX : simde_mm_cvttsd_si32(v)`, where simde's
+ /// portable version returns INT32_MIN for v <= INT32_MIN: that is exactly the saturating AArch64 fcvtzs (positive
+ /// overflow -> INT32_MAX, negative overflow -> INT32_MIN); only NaN (fcvtzs gives 0) needs the select.
+-inline int64_t fctiwz(double v) noexcept {
++REX_SMALL_HELPER int64_t fctiwz(double v) noexcept {
+ #if defined(__aarch64__)
+   int32_t r;
+   asm("fcvtzs %w0, %d1" : "=r"(r) : "w"(v));
+@@ -77,7 +90,7 @@
+ /// 360). On AArch64 simde's portable version is `(int64_t)round(v)`: halves AWAY from zero (0.5 -> 1, 2.5 -> 3) in
+ /// every mode, where the 360 and x86 give 0 and 2. `frinti` (to an integral double in the current mode, no inexact
+ /// flag) and the saturating `fcvtzs` round as the 360 does: the helper CORRECTS that build.
+-inline int64_t fctid(double v) noexcept {
++REX_SMALL_HELPER int64_t fctid(double v) noexcept {
+   if (__builtin_isnan(v)) [[unlikely]]
+     return INT64_MIN;
+ #if defined(__aarch64__)
+@@ -118,7 +131,7 @@
+ /// are the instruction alone and the signed ones add a select for the overflow, which `sdiv` answers with INT_MIN.
+ /// The C expression needs its guards (division by zero is undefined there) and the compiler keeps them as a branch.
+ /// A divisor known at compile time keeps the C expression: the compiler makes a multiplication of it.
+-inline uint32_t divwu(uint32_t n, uint32_t d) noexcept {
++REX_SMALL_HELPER uint32_t divwu(uint32_t n, uint32_t d) noexcept {
+ #if defined(__aarch64__)
+   if (!__builtin_constant_p(d)) {
+     uint32_t q;
+@@ -128,7 +141,7 @@
+ #endif
+   return d ? n / d : 0;
+ }
+-inline uint64_t divdu(uint64_t n, uint64_t d) noexcept {
++REX_SMALL_HELPER uint64_t divdu(uint64_t n, uint64_t d) noexcept {
+ #if defined(__aarch64__)
+   if (!__builtin_constant_p(d)) {
+     uint64_t q;
+@@ -139,7 +152,7 @@
+   return d ? n / d : 0;
+ }
+ /// The result as the zero-extended word the old expression assigned to the 64-bit register.
+-inline uint32_t divw(int32_t n, int32_t d) noexcept {
++REX_SMALL_HELPER uint32_t divw(int32_t n, int32_t d) noexcept {
+ #if defined(__aarch64__)
+   if (!__builtin_constant_p(d)) {
+     int32_t q;
+@@ -149,7 +162,7 @@
+ #endif
+   return uint32_t((d && !(n == INT32_MIN && d == -1)) ? n / d : 0);
+ }
+-inline int64_t divd(int64_t n, int64_t d) noexcept {
++REX_SMALL_HELPER int64_t divd(int64_t n, int64_t d) noexcept {
+ #if defined(__aarch64__)
+   if (!__builtin_constant_p(d)) {
+     int64_t q;
+@@ -166,7 +179,7 @@
+ /// the mode. Only a denormal single reads differently with the mode on; it is converted with integer arithmetic
+ /// (normalise the fraction, rebuild the double), so the function is pure and the compiler removes it when the
+ /// register is not read again.
+-inline double SingleToDoublePure(uint32_t bits) noexcept {
++REX_SMALL_HELPER double SingleToDoublePure(uint32_t bits) noexcept {
+   REX_DIET_CENSUS(4);
+   const uint32_t fraction = bits & 0x007FFFFFu;
+   if ((bits & 0x7F800000u) == 0 && fraction != 0) [[unlikely]] {
+@@ -180,7 +193,7 @@
+ 
+ /// stfs of the value such an lfs loaded: `float(double(single))` with the mode off is the single again, except
+ /// that the two conversions quiet a signalling NaN (they set the top fraction bit and keep the rest).
+-inline uint32_t QuietSingleBits(uint32_t bits) noexcept {
++REX_SMALL_HELPER uint32_t QuietSingleBits(uint32_t bits) noexcept {
+   REX_DIET_CENSUS(5);
+   return (bits & 0x7FFFFFFFu) > 0x7F800000u ? (bits | 0x00400000u) : bits;
+ }
+--- a/app/src/hot/sasrt_hot_guest.h
++++ b/app/src/hot/sasrt_hot_guest.h
+@@ -60,6 +60,8 @@
+   // sasrt-nx (2026-10-21): range checks of calls writing over 1 MB made outside verify mode (after 4, such calls are
+   // no longer checked: sub_82E7F918 writes 3.7 MB a call, 30 times a second in a movie).
+   std::atomic<uint32_t> big_checks{0};
++  // sasrt-nx (2026-11-11, sasrt_hot_guard_repeat): range checks whose difference did not repeat from the same inputs.
++  std::atomic<uint32_t> not_repeated{0};
+   // sasrt_cpu_hook_counter_ctx: this hook's counter in every thread's context (PPCContext::host_counters), given at
+   // the first call (InitHook); kNoSlot until then and when the slots ran out.
+   std::atomic<uint8_t> slot{0xFF};
+--- a/app/src/hot/sasrt_hot_guest.cpp
++++ b/app/src/hot/sasrt_hot_guest.cpp
+@@ -105,6 +105,16 @@
+     .range(1, 1 << 24)
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++// sasrt-nx (2026-11-11): the hand-written natives' range check repeats a difference before it counts, as the bulk
++// copies' guard does (cpu/banjo_hot_guest.cpp, three passes). Run bt1 (2026-11-10): the CRT memcpy native
++// (sub_82C8EEF0) switched itself off five seconds into the race on one byte of a 60-byte copy from the game image
++// (another thread writing the source between the native's run and the original's), and the generated memcpy then
++// took 108 samples of the race (the game thread's and the sound thread's top plain function).
++REXCVAR_DEFINE_BOOL(sasrt_hot_guard_repeat, true, "SASRT",
++                    "Native replacements: a range check's difference is made again from the same inputs (up to three "
++                    "passes); one that does not repeat came from another thread and is counted, not acted on")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ // sasrt-nx (2026-10-30, diagnostics): who writes a pixel shader constant register (the race start's dark Ristar: his
+ // glow scales by c146.x, gITMGF of the game's cbViewProjection, 0.05 on every renderer).
+ REXCVAR_DEFINE_INT32(sasrt_diag_ps_constant_watch, -1, "SASRT",
+@@ -267,20 +277,74 @@
+   ctx.fpscr.setcsr(hw_before);
+   ctx.fpscr.csr = csr_before;
+   h.orig(ctx, base);  // the call for real
+-  std::string diff = CompareRegs(nat, ctx, false);
+-  if (diff.empty() && HwMode(hw_native) != HwMode(ctx.fpscr.getcsr()))
+-    diff = fmt::format("hardware FPU mode native={:#x} original={:#x}", hw_native, ctx.fpscr.getcsr());
+-  off = 0;
+-  for (int i = 0; i < w.n && diff.empty(); ++i) {
+-    const uint8_t* now = Raw(base, w.r[i].addr);
+-    for (uint32_t k = 0; k < w.r[i].len; ++k) {
+-      if (now[k] != native_out[off + k]) {
+-        diff = fmt::format("memory {:#010x} (+{} of range {:#010x}+{}) native={:#04x} original={:#04x}",
+-                           w.r[i].addr + k, k, w.r[i].addr, w.r[i].len, native_out[off + k], now[k]);
+-        break;
++  auto compare = [&](const PPCContext& n, uint32_t hw_n) {
++    std::string d = CompareRegs(n, ctx, false);
++    if (d.empty() && HwMode(hw_n) != HwMode(ctx.fpscr.getcsr()))
++      d = fmt::format("hardware FPU mode native={:#x} original={:#x}", hw_n, ctx.fpscr.getcsr());
++    size_t o = 0;
++    for (int i = 0; i < w.n && d.empty(); ++i) {
++      const uint8_t* now = Raw(base, w.r[i].addr);
++      for (uint32_t k = 0; k < w.r[i].len; ++k) {
++        if (now[k] != native_out[o + k]) {
++          d = fmt::format("memory {:#010x} (+{} of range {:#010x}+{}) native={:#04x} original={:#04x}",
++                          w.r[i].addr + k, k, w.r[i].addr, w.r[i].len, native_out[o + k], now[k]);
++          break;
++        }
+       }
++      o += w.r[i].len;
+     }
+-    off += w.r[i].len;
++    return d;
++  };
++  std::string diff = compare(nat, hw_native);
++  // sasrt-nx (2026-11-11, sasrt_hot_guard_repeat): a difference must repeat. The written ranges go back to what they
++  // held before the call, the registers to the inputs, and the native and the original run again (the original for
++  // real again: what the ranges hold at the end is its result, as after a single pass). The other threads see the
++  // ranges change back and forth during the passes, as during the first one.
++  static const bool repeat = REXCVAR_GET(sasrt_hot_guard_repeat);
++  for (int attempt = 1; repeat && !diff.empty() && attempt < 3; ++attempt) {
++    off = 0;
++    for (int i = 0; i < w.n; ++i) {
++      std::memcpy(Raw(base, w.r[i].addr), before.data() + off, w.r[i].len);
++      off += w.r[i].len;
++    }
++    nat = in;
++    nat.fpscr.setcsr(hw_before);
++    nat.fpscr.csr = csr_before;
++    if (!h.native(nat, base)) {  // declined this time: the original's result (restored below) stands, nothing compared
++      off = 0;
++      for (int i = 0; i < w.n; ++i) {
++        std::memcpy(Raw(base, w.r[i].addr), before.data() + off, w.r[i].len);
++        off += w.r[i].len;
++      }
++      ctx = in;
++      ctx.fpscr.setcsr(hw_before);
++      ctx.fpscr.csr = csr_before;
++      h.orig(ctx, base);
++      h.not_repeated.fetch_add(1, std::memory_order_relaxed);
++      diff.clear();
++      break;
++    }
++    const uint32_t hw_again = nat.fpscr.getcsr();
++    off = 0;
++    for (int i = 0; i < w.n; ++i) {
++      std::memcpy(native_out.data() + off, Raw(base, w.r[i].addr), w.r[i].len);
++      std::memcpy(Raw(base, w.r[i].addr), before.data() + off, w.r[i].len);  // roll back
++      off += w.r[i].len;
++    }
++    ctx = in;
++    ctx.fpscr.setcsr(hw_before);
++    ctx.fpscr.csr = csr_before;
++    h.orig(ctx, base);  // the call for real, again
++    std::string again = compare(nat, hw_again);
++    if (again.empty()) {
++      const uint32_t n = h.not_repeated.fetch_add(1, std::memory_order_relaxed) + 1;
++      if (n <= 4 || n == 64 || n == 4096)
++        REXLOG_WARN("[hot] {} ({}): a difference did not repeat (pass {}; {} so far: another thread changed the "
++                    "inputs between the runs; the native stays on): {}", h.name, h.key->key, attempt + 1, n, diff);
++      diff.clear();
++      break;
++    }
++    diff = std::move(again);
+   }
+   Report(h, in, diff);
+ }
+--- a/tools/localize_native.py
++++ b/tools/localize_native.py
+@@ -438,7 +438,11 @@
+         # sasrt-nx (2026-11-08): this port's configuration files, as tools/direct_calls.py reads them (the GPU
+         # functions, the overrides, the manifest). Not app/thunks.toml: it names every .xidata thunk and its
+         # target, which are not hooks (with it, 290 of the profile's functions were left out as hooked).
+-        tomls = [os.path.join(APP, 'config', 'renut_gpu_funcs.toml'), os.path.join(APP, 'overrides.toml'),
++        # sasrt-nx (2026-11-11, machine-copy idea 29): not app/config/renut_gpu_funcs.toml any more. It is this game's map
++        # of Direct3D's names (342 functions; a reference: no code hooks through it, and tools/direct_calls.py does not
++        # read it), and it kept every function it names out of the copies (D3D_SetViewport and the like were 0.4 % of
++        # the race's samples, plain). A function a source really hooks is still found in the source.
++        tomls = [os.path.join(APP, 'overrides.toml'),
+                  os.path.join(APP, 'perf_overrides.toml'), os.path.join(APP, 'sasrt_manifest.toml')]
+         paths = [(p, True) for p in tomls if os.path.isfile(p)]
+         for root in roots:
+--- a/app/src/cpu/hot/localized_bulk.txt
++++ b/app/src/cpu/hot/localized_bulk.txt
+@@ -1242,3 +1242,9 @@
+ 82BEB690 3 console samples, 470 instructions, 6 direct callees
+ 82B06358 3 console samples, 94 instructions, 1 direct callees
+ 826C4078 3 console samples, 106 instructions, 2 direct callees
++827506C0 119 console samples, 724 instructions, 18 direct callees
++8274FEE8 43 console samples, 502 instructions, 17 direct callees
++82CCF070 12 console samples, 180 instructions, 1 direct callees
++82CCF4C8 5 console samples, 274 instructions, 1 direct callees
++82CD51B8 4 console samples, 270 instructions, 2 direct callees
++826BA7B0 3 console samples, 158 instructions, 2 direct callees
